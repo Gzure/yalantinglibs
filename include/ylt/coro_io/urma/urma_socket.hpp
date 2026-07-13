@@ -232,7 +232,14 @@ struct urma_socket_shared_state_t
     urma_sg_t sg{&sge, 1};
     urma_jfr_wr_t wr{sg, 0, nullptr};
     urma_jfr_wr_t* bad_wr = nullptr;
-    auto ec = make_urma_error(urma_post_jfr_wr(jfr_.get(), &wr, &bad_wr));
+    // Use urma_post_jetty_recv_wr instead of urma_post_jfr_wr.
+    // For bonding devices with share_jfr=1, recv WRs must go through
+    // the jetty so the bonding layer can distribute them to physical
+    // devices. Posting directly to JFR bypasses the bonding routing,
+    // causing recv buffers to be unavailable on the physical device
+    // that the sender's CTP path routes to, resulting in RNR (status=10).
+    auto ec = make_urma_error(
+        urma_post_jetty_recv_wr(jetty_.get(), &wr, &bad_wr));
     if (!ec) recv_queue_.push(std::move(buffer));
     return ec;
   }

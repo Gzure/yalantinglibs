@@ -46,9 +46,6 @@
 #include "ylt/easylog.hpp"
 #include "ylt/struct_pack.hpp"
 #include "ylt/urma/urma_api.h"
-#ifdef YLT_ENABLE_URMA
-#include "ylt/urma/urma_ubagg.h"
-#endif
 
 namespace coro_io {
 namespace detail {
@@ -837,28 +834,8 @@ class urma_socket_t {
 
     urma_token_t token{};
     errno = 0;
-
-    // For bonding devices in RM mode, the URMA perftest sets has_drv_ext=1
-    // and passes a bondp_rjetty_t containing the local jetty pointer
-    // (perftest_resources.c:1676-1684).  The bonding driver uses this
-    // to establish the virtual connection routing table.  Without it,
-    // the bonding layer doesn't know which physical device to route
-    // SENDs to, causing the first SEND to be immediately rejected
-    // with URMA_CR_RNR_RETRY_CNT_EXC_ERR (status=10).
-    bool is_bonding = state_->device_->name().compare(0, 7, "bonding") == 0;
-    if (is_bonding && remote.trans_mode == URMA_TM_RM) {
-      bondp_rjetty_t bondp_rjetty{};
-      bondp_rjetty.base = remote;
-      bondp_rjetty.base.flag.bs.has_drv_ext = 1;
-      bondp_rjetty.jetty = state_->jetty_.get();
-      state_->remote_jetty_.reset(
-          urma_import_jetty(state_->device_->context(),
-                            &bondp_rjetty.base, &token));
-    } else {
-      state_->remote_jetty_.reset(
-          urma_import_jetty(state_->device_->context(), &remote, &token));
-    }
-
+    state_->remote_jetty_.reset(
+        urma_import_jetty(state_->device_->context(), &remote, &token));
     if (!state_->remote_jetty_) {
       auto error = errno != 0
                        ? std::error_code(errno, std::generic_category())
@@ -880,6 +857,27 @@ class urma_socket_t {
     send_window_size_ = std::min<std::size_t>(
         conf_.send_buffer_cnt,
         remote_recv_capacity > 1 ? remote_recv_capacity - 1 : 1);
+
+    // Advise the local jetty with the imported remote jetty.
+    // The URMA perftest reference implementation calls urma_advise_jetty
+    // after urma_import_jetty for RM mode (perftest_resources.c:1698-1706).
+    // Without this step, the local JFS send path is not bound to the
+    // imported target jetty, so the hardware has no receiver association
+    // and the first SEND is immediately rejected with
+    // URMA_CR_RNR_RETRY_CNT_EXC_ERR (status=10).
+    errno = 0;
+    auto advise_ret =
+        urma_advise_jetty(state_->jetty_.get(), state_->remote_jetty_.get());
+    if (advise_ret != URMA_SUCCESS && advise_ret != URMA_EEXIST) {
+      ELOG_WARN << "urma_advise_jetty failed: ret=" << advise_ret
+                << ", errno=" << errno
+                << ", continuing anyway";
+    } else {
+      ELOG_INFO << "urma_advise_jetty succeeded"
+                << ", local_jetty=" << state_->jetty_->jetty_id.id
+                << ", remote_jetty=" << peer.jetty_id;
+    }
+
     ELOG_INFO << "URMA peer imported: remote_recv_buffer_cnt="
               << peer.recv_buffer_cnt
               << ", local_send_buffer_cnt=" << conf_.send_buffer_cnt

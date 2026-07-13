@@ -125,7 +125,7 @@ struct urma_socket_shared_state_t
     }
   }
 
-  bool init(std::size_t cq_size, std::size_t send_buffer_cnt) {
+  bool init(std::size_t cq_size, std::size_t send_buffer_cnt, urma_tp_type_t tp_type) {
     const auto& cap = device_->attr().dev_cap;
     ELOG_INFO << "URMA resource init: device=" << device_->name()
               << ", eid=" << device_->eid_string()
@@ -188,8 +188,8 @@ struct urma_socket_shared_state_t
     auto& dev_cap = device_->attr().dev_cap;
     uint8_t jfs_priority = URMA_MAX_PRIORITY;
     union urma_tp_type_en tp_type_en{};
-    tp_type_en.bs.ctp = (conf_.tp_type == URMA_CTP) ? 1 : 0;
-    tp_type_en.bs.rtp = (conf_.tp_type == URMA_RTP) ? 1 : 0;
+    tp_type_en.bs.ctp = (tp_type == URMA_CTP) ? 1 : 0;
+    tp_type_en.bs.rtp = (tp_type == URMA_RTP) ? 1 : 0;
     for (int i = 0; i <= URMA_MAX_PRIORITY; ++i) {
       if (tp_type_en.value == dev_cap.priority_info[i].tp_type.value) {
         jfs_priority = static_cast<uint8_t>(i);
@@ -781,7 +781,7 @@ class urma_socket_t {
     state_ = std::make_shared<detail::urma_socket_shared_state_t>(
         std::move(device), executor_, conf_.recv_buffer_cnt,
         conf_.send_buffer_cnt, conf_.cq_size);
-    if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt)) {
+    if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.tp_type)) {
       auto stage = state_->init_stage_;
       auto error = state_->init_error_;
       ELOG_ERROR << "URMA socket resource initialization failed: stage="

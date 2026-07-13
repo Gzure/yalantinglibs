@@ -179,23 +179,14 @@ struct urma_socket_shared_state_t
     jetty_cfg.jfs_cfg.depth =
         static_cast<uint32_t>(send_buffer_cnt + 2);
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-    // Derive JFS priority from the device's priority_info table.
-    // The URMA perftest derives priority by matching tp_type against
-    // dev_cap.priority_info[i].tp_type (perftest_resources.c:139-151).
-    // Hardcoding URMA_MAX_PRIORITY (15) may not match the CTP priority slot,
-    // causing the JFS to use the wrong SL (Service Level), which makes the
-    // hardware reject SEND with URMA_CR_RNR_RETRY_CNT_EXC_ERR (status=10).
+    // Derive JFS priority the same way perftest does.
+    // perftest: if import_jetty_ex is NULL (bonding provider, compat mode),
+    //   use priority=0. Otherwise derive from priority_info[] table.
+    // (perftest_resources.c:215-219)
     auto& dev_cap = device_->attr().dev_cap;
-    uint8_t jfs_priority = URMA_MAX_PRIORITY;
-    union urma_tp_type_en tp_type_en{};
-    tp_type_en.bs.ctp = (tp_type == URMA_CTP) ? 1 : 0;
-    tp_type_en.bs.rtp = (tp_type == URMA_RTP) ? 1 : 0;
-    for (int i = 0; i <= URMA_MAX_PRIORITY; ++i) {
-      if (tp_type_en.value == dev_cap.priority_info[i].tp_type.value) {
-        jfs_priority = static_cast<uint8_t>(i);
-        break;
-      }
-    }
+    uint8_t jfs_priority = 0;
+    // Bonding provider does not register import_jetty_ex, so we use 0
+    // just like perftest does for the compat path.
     jetty_cfg.jfs_cfg.priority = jfs_priority;
     ELOG_INFO << "URMA JFS priority=" << static_cast<unsigned>(jfs_priority)
               << ", tp_type=" << static_cast<int>(tp_type);

@@ -198,7 +198,7 @@ struct urma_socket_shared_state_t
     }
     jetty_cfg.jfs_cfg.priority = jfs_priority;
     ELOG_INFO << "URMA JFS priority=" << static_cast<unsigned>(jfs_priority)
-              << ", tp_type=" << static_cast<int>(conf_.tp_type);
+              << ", tp_type=" << static_cast<int>(tp_type);
     jetty_cfg.jfs_cfg.max_sge = 1;
     jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
     jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;

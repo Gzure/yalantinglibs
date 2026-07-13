@@ -857,6 +857,27 @@ class urma_socket_t {
     send_window_size_ = std::min<std::size_t>(
         conf_.send_buffer_cnt,
         remote_recv_capacity > 1 ? remote_recv_capacity - 1 : 1);
+
+    // Advise the local jetty with the imported remote jetty.
+    // The URMA perftest reference implementation calls urma_advise_jetty
+    // after urma_import_jetty for RM mode (perftest_resources.c:1698-1706).
+    // Without this step, the local JFS send path is not bound to the
+    // imported target jetty, so the hardware has no receiver association
+    // and the first SEND is immediately rejected with
+    // URMA_CR_RNR_RETRY_CNT_EXC_ERR (status=10).
+    errno = 0;
+    auto advise_ret =
+        urma_advise_jetty(state_->jetty_.get(), state_->remote_jetty_.get());
+    if (advise_ret != URMA_SUCCESS && advise_ret != URMA_EEXIST) {
+      ELOG_WARN << "urma_advise_jetty failed: ret=" << advise_ret
+                << ", errno=" << errno
+                << ", continuing anyway";
+    } else {
+      ELOG_INFO << "urma_advise_jetty succeeded"
+                << ", local_jetty=" << state_->jetty_->jetty_id.id
+                << ", remote_jetty=" << peer.jetty_id;
+    }
+
     ELOG_INFO << "URMA peer imported: remote_recv_buffer_cnt="
               << peer.recv_buffer_cnt
               << ", local_send_buffer_cnt=" << conf_.send_buffer_cnt

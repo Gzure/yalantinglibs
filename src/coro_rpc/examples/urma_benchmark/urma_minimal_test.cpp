@@ -133,20 +133,10 @@ static bool init_device(test_context* ctx, const test_config& cfg) {
     return false;
   }
 
-  // Find device
-  int num_devices = 0;
-  urma_device_t** devs = urma_get_device_list(&num_devices);
-  if (!devs || num_devices <= 0) {
-    fprintf(stderr, "urma_get_device_list failed\n");
-    return false;
-  }
-  urma_device_t* dev = nullptr;
-  for (int i = 0; i < num_devices; i++) {
-    if (strcmp(urma_get_device_name(devs[i]), cfg.device.c_str()) == 0) {
-      dev = devs[i];
-      break;
-    }
-  }
+  // Find device by name (simpler than iterating list)
+  char dev_name_buf[256];
+  strncpy(dev_name_buf, cfg.device.c_str(), sizeof(dev_name_buf) - 1);
+  urma_device_t* dev = urma_get_device_by_name(dev_name_buf);
   if (!dev) {
     fprintf(stderr, "device '%s' not found\n", cfg.device.c_str());
     return false;
@@ -159,7 +149,7 @@ static bool init_device(test_context* ctx, const test_config& cfg) {
   }
   ctx->dev_attr = attr;
 
-  urma_context_t* urma_ctx = urma_open_device(dev, cfg.eid_index);
+  urma_context_t* urma_ctx = urma_create_context(dev, cfg.eid_index);
   if (!urma_ctx) {
     fprintf(stderr, "urma_open_device failed\n");
     return false;

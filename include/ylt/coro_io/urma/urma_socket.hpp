@@ -244,9 +244,6 @@ struct urma_socket_shared_state_t
     urma_sg_t sg{&sge, 1};
     urma_jfr_wr_t wr{sg, 0, nullptr};
     urma_jfr_wr_t* bad_wr = nullptr;
-    // Use urma_post_jetty_recv_wr to post recv through the jetty (bonding-
-    // aware).  urma_post_jfr_wr posts directly to the JFR and bypasses the
-    // bonding layer, causing recv buffers to miss the physical device.
     auto ec = make_urma_error(
         urma_post_jetty_recv_wr(jetty_.get(), &wr, &bad_wr));
     if (!ec) recv_queue_.push(std::move(buffer));
@@ -398,6 +395,22 @@ struct urma_socket_shared_state_t
 
   void poll_once() {
     if (has_close_) return;
+
+    // Event-driven: check for CQ events via JFCE (non-blocking, timeout=0).
+    // Matching perftest's wait_jfc_event (perftest_run_test.c:204-219).
+    if (jfce_) {
+      urma_jfc_t* ev_jfc = nullptr;
+      int ret = urma_wait_jfc(jfce_, 1, 0, &ev_jfc);
+      if (ret > 0 && ev_jfc == jfc_.get()) {
+        // Acknowledge and rearm before polling
+        uint32_t ack_cnt = 1;
+        urma_ack_jfc((urma_jfc_t**)&ev_jfc, &ack_cnt, 1);
+      }
+      // Rearm regardless (rearm is idempotent, matching perftest's
+      // rearm_jfc called before the poll loop).
+      urma_rearm_jfc(jfc_.get(), false);
+    }
+
     auto [poll_ec, completion_count] = poll_completion();
     if (poll_ec) {
       fail_pending(poll_ec);

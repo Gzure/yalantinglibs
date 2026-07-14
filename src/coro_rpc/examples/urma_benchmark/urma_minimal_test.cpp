@@ -330,9 +330,10 @@ static bool post_recv_buffers(test_context* ctx, const test_config& cfg) {
     ctx->jfr_sge[i].tseg = ctx->local_tseg;
     urma_sg_t sg{&ctx->jfr_sge[i], 1};
     urma_jfr_wr_t wr{sg, i, nullptr};
-    auto st = urma_post_jfr_wr(ctx->jfr, &wr, &bad_wr);
+    // DUPLEX mode: use urma_post_jetty_recv_wr (perftest_run_test.c:1312)
+    auto st = urma_post_jetty_recv_wr(ctx->jetty, &wr, &bad_wr);
     if (st != URMA_SUCCESS) {
-      fprintf(stderr, "urma_post_jfr_wr[%u] failed: %d\n", i, (int)st);
+      fprintf(stderr, "urma_post_jetty_recv_wr[%u] failed: %d\n", i, (int)st);
       return false;
     }
   }

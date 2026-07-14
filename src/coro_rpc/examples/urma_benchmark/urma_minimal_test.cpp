@@ -108,6 +108,7 @@ struct test_context {
   urma_jfc_t* jfc = nullptr;
   urma_jfr_t* jfr = nullptr;
   urma_jetty_t* jetty = nullptr;
+  urma_jfs_t* jfs = nullptr;  // separate JFS for bonding JFR import
 
   // Data buffer (persistent, not local variable)
   void* local_buf = nullptr;
@@ -120,6 +121,7 @@ struct test_context {
   // Remote resources
   urma_target_seg_t* import_tseg = nullptr;
   urma_target_jetty_t* import_tjetty = nullptr;
+  urma_target_jetty_t* import_tjfr = nullptr;  // imported remote JFR
 
   // Stats
   uint64_t scnt = 0;  // send count
@@ -227,6 +229,22 @@ static bool create_resources(test_context* ctx, const test_config& cfg) {
     return false;
   }
 
+  // Create separate JFS for bonding JFR import (perftest create_jfs:441-453)
+  urma_jfs_cfg_t jfs_cfg{};
+  jfs_cfg.depth = static_cast<uint32_t>(cfg.jfs_depth);
+  jfs_cfg.trans_mode = URMA_TM_RM;
+  jfs_cfg.priority = cfg.priority;
+  jfs_cfg.max_sge = 1;
+  jfs_cfg.max_rsge = 1;
+  jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
+  jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
+  jfs_cfg.jfc = ctx->jfc;
+  ctx->jfs = urma_create_jfs(ctx->urma_ctx, &jfs_cfg);
+  if (!ctx->jfs) {
+    fprintf(stderr, "urma_create_jfs failed\n");
+    return false;
+  }
+
   return true;
 }
 
@@ -326,6 +344,31 @@ static bool import_remote_peer(test_context* ctx, const handshake_info& peer,
     fprintf(stderr, "urma_import_jetty failed: errno=%d\n", errno);
     return false;
   }
+
+  // Import remote JFR (perftest connect_jfr_default:1514-1560).
+  // This establishes the routing from our local JFS to the remote JFR.
+  urma_token_t jfr_token{};
+  urma_rjfr_t rjfr{};
+  rjfr.jfr_id = peer.jetty_id;  // JFR shares the same ID as the jetty
+  rjfr.trans_mode = URMA_TM_RM;
+  rjfr.tp_type = cfg.tp_type;
+
+  bondp_rjfr_t bondp_rjfr{};
+  if (is_bonding) {
+    rjfr.flag.bs.has_drv_ext = 1;
+    bondp_rjfr.base = rjfr;
+    bondp_rjfr.jfs = ctx->jfs;  // separate JFS for bonding
+  }
+
+  ctx->import_tjfr = urma_import_jfr(
+      ctx->urma_ctx,
+      is_bonding ? &bondp_rjfr.base : &rjfr,
+      &jfr_token);
+  if (!ctx->import_tjfr) {
+    fprintf(stderr, "urma_import_jfr failed: errno=%d\n", errno);
+    // Continue anyway; the JFR import is a routing hint
+  }
+
   return true;
 }
 

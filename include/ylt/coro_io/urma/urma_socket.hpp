@@ -404,7 +404,7 @@ struct urma_socket_shared_state_t
       if (ret > 0 && ev_jfc == jfc_.get()) {
         // Acknowledge and rearm before polling
         uint32_t ack_cnt = 1;
-        urma_ack_jfc((urma_jfc_t**)&ev_jfc, &ack_cnt, 1);
+        urma_ack_jfc(&ev_jfc, &ack_cnt, 1);
       }
       // Rearm regardless (rearm is idempotent, matching perftest's
       // rearm_jfc called before the poll loop).

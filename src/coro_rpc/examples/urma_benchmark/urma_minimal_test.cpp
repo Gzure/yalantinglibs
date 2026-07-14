@@ -108,14 +108,16 @@ struct test_context {
   urma_jfr_t* jfr = nullptr;
   urma_jetty_t* jetty = nullptr;
 
-  // Data buffer
+  // Data buffer (persistent, not local variable)
   void* local_buf = nullptr;
   urma_target_seg_t* local_tseg = nullptr;  // local registered segment
 
+  // Pre-allocated SGEs for JFR WRs (must outlive urma_post_jfr_wr)
+  urma_sge_t* jfr_sge = nullptr;
+  uint32_t jfr_sge_count = 0;
+
   // Remote resources
-  urma_seg_t remote_seg{};              // received via TCP
   urma_target_seg_t* import_tseg = nullptr;
-  urma_rjetty_t remote_jetty_id{};      // received via TCP
   urma_target_jetty_t* import_tjetty = nullptr;
 
   // Stats
@@ -312,18 +314,25 @@ static bool import_remote_peer(test_context* ctx, const handshake_info& peer,
 }
 
 static bool post_recv_buffers(test_context* ctx, const test_config& cfg) {
-  // Post recv buffers using urma_post_jfr_wr matching perftest SEND BW
-  // (perftest_run_test.c:1305).  For share_jfr, the JFR is shared by the jetty.
+  // Allocate persistent SGEs (must outlive urma_post_jfr_wr, matching
+  // perftest alloc_jfr_ctx_buffer pattern).
+  ctx->jfr_sge_count = cfg.jfr_depth;
+  ctx->jfr_sge = (urma_sge_t*)calloc(ctx->jfr_sge_count, sizeof(urma_sge_t));
+  if (!ctx->jfr_sge) {
+    fprintf(stderr, "calloc jfr_sge failed\n");
+    return false;
+  }
+
   urma_jfr_wr_t* bad_wr = nullptr;
   for (uint32_t i = 0; i < cfg.jfr_depth; i++) {
-    char* buf = (char*)ctx->local_buf;
-    urma_sge_t sge{(uint64_t)buf, cfg.payload_size,
-                   (urma_target_seg_t*)ctx->local_tseg, nullptr};
-    urma_sg_t sg{&sge, 1};
-    urma_jfr_wr_t wr{sg, 0, nullptr};
+    ctx->jfr_sge[i].addr = (uint64_t)ctx->local_buf;
+    ctx->jfr_sge[i].len = cfg.payload_size;
+    ctx->jfr_sge[i].tseg = ctx->local_tseg;
+    urma_sg_t sg{&ctx->jfr_sge[i], 1};
+    urma_jfr_wr_t wr{sg, i, nullptr};
     auto st = urma_post_jfr_wr(ctx->jfr, &wr, &bad_wr);
     if (st != URMA_SUCCESS) {
-      fprintf(stderr, "urma_post_jfr_wr failed: %d\n", (int)st);
+      fprintf(stderr, "urma_post_jfr_wr[%u] failed: %d\n", i, (int)st);
       return false;
     }
   }

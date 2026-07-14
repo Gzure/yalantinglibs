@@ -482,7 +482,6 @@ struct urma_socket_shared_state_t
   std::unique_ptr<urma_target_jetty_t, urma_deleter> remote_jetty_;
   std::unique_ptr<urma_target_seg_t, urma_deleter> remote_seg_;
   std::size_t recv_buffer_cnt_;
-  std::size_t recv_buffer_cnt_;
   circle_buffer<urma_buffer_t> recv_queue_;
   circle_buffer<pending_recv> recv_result_;
   circle_buffer<pending_send> send_callbacks_;

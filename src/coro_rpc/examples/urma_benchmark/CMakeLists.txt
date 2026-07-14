@@ -3,6 +3,10 @@ if (YLT_ENABLE_URMA)
   add_executable(coro_rpc_urma_benchmark
       urma_benchmark.cpp
     )
+  add_executable(coro_rpc_urma_minimal_test
+      urma_minimal_test.cpp
+    )
+  target_link_libraries(coro_rpc_urma_minimal_test PRIVATE yalantinglibs::yalantinglibs)
 else()
   add_custom_target(coro_rpc_urma_benchmark
     COMMAND ${CMAKE_COMMAND} -E echo

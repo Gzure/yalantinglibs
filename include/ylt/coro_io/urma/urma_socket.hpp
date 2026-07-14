@@ -46,6 +46,7 @@
 #include "ylt/easylog.hpp"
 #include "ylt/struct_pack.hpp"
 #include "ylt/urma/urma_api.h"
+#include "ylt/urma/urma_ubagg.h"
 
 namespace coro_io {
 namespace detail {
@@ -138,6 +139,31 @@ struct urma_socket_shared_state_t
               << ", max_jfr_depth=" << cap.max_jfr_depth
               << ", max_jfs_depth=" << cap.max_jfs_depth;
 
+    // Initialize bonding device mode if applicable (mimics perftest
+    // init_device, perftest_resources.c:237-253).  Must be called before
+    // any JFC/JFR/jetty creation on bonding devices.
+    auto dev_name = device_->name();
+    if (dev_name.compare(0, 7, "bonding") == 0) {
+      static std::once_flag bonding_ctl_flag;
+      std::call_once(bonding_ctl_flag, [this]() {
+        bondp_set_bonding_mode_in_t in_arg{};
+        in_arg.bonding_mode = BONDP_BONDING_MODE_STANDALONE;
+        in_arg.bonding_level = BONDP_BONDING_LEVEL_IODIE;
+        urma_user_ctl_in_t in{};
+        in.addr = reinterpret_cast<uint64_t>(&in_arg);
+        in.len = sizeof(in_arg);
+        in.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
+        urma_user_ctl_out_t out{};
+        auto st = urma_user_ctl(device_->context(), &in, &out);
+        if (st != URMA_SUCCESS) {
+          ELOG_WARN << "urma_user_ctl SET_BONDING_MODE failed: "
+                    << static_cast<int>(st);
+        } else {
+          ELOG_INFO << "urma_user_ctl SET_BONDING_MODE succeeded";
+        }
+      });
+    }
+
     urma_jfc_cfg_t jfc_cfg{};
     jfc_cfg.depth = static_cast<uint32_t>(cq_size);
     errno = 0;
@@ -222,7 +248,11 @@ struct urma_socket_shared_state_t
     urma_sg_t sg{&sge, 1};
     urma_jfr_wr_t wr{sg, 0, nullptr};
     urma_jfr_wr_t* bad_wr = nullptr;
-    auto ec = make_urma_error(urma_post_jfr_wr(jfr_.get(), &wr, &bad_wr));
+    // Use urma_post_jetty_recv_wr to post recv through the jetty (bonding-
+    // aware).  urma_post_jfr_wr posts directly to the JFR and bypasses the
+    // bonding layer, causing recv buffers to miss the physical device.
+    auto ec = make_urma_error(
+        urma_post_jetty_recv_wr(jetty_.get(), &wr, &bad_wr));
     if (!ec) recv_queue_.push(std::move(buffer));
     return ec;
   }
@@ -490,7 +520,13 @@ class urma_socket_t {
     uint32_t buffer_size;
     uint16_t recv_buffer_cnt;
     uint8_t tp_type;
-    urma_seg_t seg;  // buffer pool segment for import_seg
+    // Buffer pool segment info for urma_import_seg (flattened from urma_seg_t
+    // which contains unions/bitfields not trivially serializable by struct_pack).
+    uint8_t seg_eid[16];
+    uint32_t seg_uasid;
+    uint64_t seg_va;
+    uint64_t seg_len;
+    uint32_t seg_token_id;
     constexpr static auto struct_pack_config = struct_pack::DISABLE_TYPE_INFO;
   };
 
@@ -772,7 +808,12 @@ class urma_socket_t {
     info.buffer_size = buffer_pool()->buffer_size();
     info.recv_buffer_cnt = conf_.recv_buffer_cnt;
     info.tp_type = static_cast<uint8_t>(conf_.tp_type);
-    info.seg = buffer_pool()->seg();
+    auto pool_seg = buffer_pool()->seg();
+    std::memcpy(info.seg_eid, pool_seg.ubva.eid.raw, 16);
+    info.seg_uasid = pool_seg.ubva.uasid;
+    info.seg_va = pool_seg.ubva.va;
+    info.seg_len = pool_seg.len;
+    info.seg_token_id = pool_seg.token_id;
     return info;
   }
 
@@ -802,7 +843,12 @@ class urma_socket_t {
     seg_flag.bs.access =
         URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
     seg_flag.bs.mapping = URMA_SEG_NOMAP;
-    urma_seg_t peer_seg = peer.seg;
+    urma_seg_t peer_seg{};
+    std::memcpy(peer_seg.ubva.eid.raw, peer.seg_eid, 16);
+    peer_seg.ubva.uasid = peer.seg_uasid;
+    peer_seg.ubva.va = peer.seg_va;
+    peer_seg.len = peer.seg_len;
+    peer_seg.token_id = peer.seg_token_id;
     state_->remote_seg_.reset(
         urma_import_seg(state_->device_->context(), &peer_seg,
                         &seg_token, 0, seg_flag));
@@ -816,8 +862,27 @@ class urma_socket_t {
 
     urma_token_t token{};
     errno = 0;
-    state_->remote_jetty_.reset(
-        urma_import_jetty(state_->device_->context(), &remote, &token));
+
+    // For bonding devices in RM mode, pass has_drv_ext and the local jetty
+    // pointer via bondp_rjetty_t so the bonding driver (bondp_import_jetty)
+    // establishes the virtual connection routing table.  Without this, the
+    // bonding layer cannot route SENDs to the correct physical device,
+    // causing the first SEND to be rejected with status=10.
+    auto dev_name = state_->device_->name();
+    if (dev_name.compare(0, 7, "bonding") == 0 &&
+        remote.trans_mode == URMA_TM_RM) {
+      bondp_rjetty_t bondp_rjetty{};
+      bondp_rjetty.base = remote;
+      bondp_rjetty.base.flag.bs.has_drv_ext = 1;
+      bondp_rjetty.jetty = state_->jetty_.get();
+      state_->remote_jetty_.reset(
+          urma_import_jetty(state_->device_->context(),
+                            &bondp_rjetty.base, &token));
+    } else {
+      state_->remote_jetty_.reset(
+          urma_import_jetty(state_->device_->context(), &remote, &token));
+    }
+
     if (!state_->remote_jetty_) {
       auto error = errno != 0
                        ? std::error_code(errno, std::generic_category())

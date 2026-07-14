@@ -384,6 +384,10 @@ struct urma_socket_shared_state_t
   }
 
   void start_polling() {
+    // Rearm JFCE so the event channel is ready for the next poll cycle.
+    if (jfce_) {
+      urma_rearm_jfc(jfc_.get(), false);
+    }
     auto self = shared_from_this();
     poll_timer_.expires_after(idle_poll_interval_);
     poll_timer_.async_wait([self](const std::error_code& ec) {
@@ -394,11 +398,6 @@ struct urma_socket_shared_state_t
 
   void poll_once() {
     if (has_close_) return;
-    // Rearm JFCE before polling so the event channel is armed and ready
-    // to notify new completions after the current poll cycle.
-    if (jfce_) {
-      urma_rearm_jfc(jfc_.get(), false);
-    }
     auto [poll_ec, completion_count] = poll_completion();
     if (poll_ec) {
       fail_pending(poll_ec);

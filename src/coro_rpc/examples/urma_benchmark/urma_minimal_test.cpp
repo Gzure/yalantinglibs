@@ -13,6 +13,7 @@
 #include <thread>
 #include <chrono>
 #include <random>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -230,11 +231,14 @@ static bool create_resources(test_context* ctx, const test_config& cfg) {
 }
 
 static bool register_data_buffer(test_context* ctx, const test_config& cfg) {
-  // Allocate and register data buffer (perftest register_mem:756-813)
-  size_t buf_len = cfg.payload_size * 4;  // enough space
-  ctx->local_buf = ::aligned_alloc(4096, buf_len);
-  if (!ctx->local_buf) {
-    perror("aligned_alloc");
+  // Allocate and register data buffer (use mmap like coro_rpc buffer pool)
+  size_t buf_len = cfg.payload_size * 4;
+  long page_size = ::sysconf(_SC_PAGESIZE);
+  buf_len = (buf_len + page_size - 1) / page_size * page_size;
+  ctx->local_buf = ::mmap(nullptr, buf_len, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (ctx->local_buf == MAP_FAILED) {
+    perror("mmap");
     return false;
   }
   memset(ctx->local_buf, 'x', buf_len);
@@ -247,7 +251,11 @@ static bool register_data_buffer(test_context* ctx, const test_config& cfg) {
   urma_seg_cfg_t seg_cfg{};
   seg_cfg.va = (uint64_t)ctx->local_buf;
   seg_cfg.len = buf_len;
+  seg_cfg.token_id = nullptr;
+  seg_cfg.token_value = {};
   seg_cfg.flag = flag;
+  seg_cfg.user_ctx = (uint64_t)ctx->local_buf;
+  seg_cfg.iova = 0;
 
   ctx->local_tseg = urma_register_seg(ctx->urma_ctx, &seg_cfg);
   if (!ctx->local_tseg) {

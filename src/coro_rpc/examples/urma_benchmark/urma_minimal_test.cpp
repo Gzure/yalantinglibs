@@ -390,7 +390,6 @@ static int run_server(uint16_t port, const test_config& cfg) {
   if (!init_device(&ctx, cfg)) return 1;
   if (!create_resources(&ctx, cfg)) return 1;
   if (!register_data_buffer(&ctx, cfg)) return 1;
-  if (!post_recv_buffers(&ctx, cfg)) return 1;
 
   // Wait for TCP connection
   int listen_fd = tcp_listen(port);
@@ -413,8 +412,11 @@ static int run_server(uint16_t port, const test_config& cfg) {
   }
   ::close(conn_fd);
 
-  // Import peer
+  // Import peer FIRST (matching perftest: connect_jetty before post_recv)
   if (!import_remote_peer(&ctx, peer_info, cfg)) return 1;
+
+  // Then post recv buffers (after remote jetty is established)
+  if (!post_recv_buffers(&ctx, cfg)) return 1;
 
   printf("[server] waiting for sends...\n");
 

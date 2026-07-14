@@ -155,12 +155,8 @@ struct urma_socket_shared_state_t
         in.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
         urma_user_ctl_out_t out{};
         auto st = urma_user_ctl(device_->context(), &in, &out);
-        if (st != URMA_SUCCESS) {
-          ELOG_WARN << "urma_user_ctl SET_BONDING_MODE failed: "
-                    << static_cast<int>(st);
-        } else {
-          ELOG_INFO << "urma_user_ctl SET_BONDING_MODE succeeded";
-        }
+        ELOG_DEBUG << "urma_user_ctl SET_BONDING_MODE: "
+                   << static_cast<int>(st);
       });
     }
 

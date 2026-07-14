@@ -312,18 +312,18 @@ static bool import_remote_peer(test_context* ctx, const handshake_info& peer,
 }
 
 static bool post_recv_buffers(test_context* ctx, const test_config& cfg) {
-  // Post recv buffers matching perftest (urma_post_jetty_recv_wr for shared jetty)
+  // Post recv buffers using urma_post_jfr_wr matching perftest SEND BW
+  // (perftest_run_test.c:1305).  For share_jfr, the JFR is shared by the jetty.
   urma_jfr_wr_t* bad_wr = nullptr;
   for (uint32_t i = 0; i < cfg.jfr_depth; i++) {
-    // Get a buffer from our registered segment
-    char* buf = (char*)ctx->local_buf + cfg.payload_size * 2;  // use offset area
+    char* buf = (char*)ctx->local_buf;
     urma_sge_t sge{(uint64_t)buf, cfg.payload_size,
                    (urma_target_seg_t*)ctx->local_tseg, nullptr};
     urma_sg_t sg{&sge, 1};
     urma_jfr_wr_t wr{sg, 0, nullptr};
-    auto st = urma_post_jetty_recv_wr(ctx->jetty, &wr, &bad_wr);
+    auto st = urma_post_jfr_wr(ctx->jfr, &wr, &bad_wr);
     if (st != URMA_SUCCESS) {
-      fprintf(stderr, "urma_post_jetty_recv_wr failed: %d\n", (int)st);
+      fprintf(stderr, "urma_post_jfr_wr failed: %d\n", (int)st);
       return false;
     }
   }

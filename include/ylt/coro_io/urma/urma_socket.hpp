@@ -912,7 +912,7 @@ class urma_socket_t {
       rjfr.tp_type = static_cast<urma_tp_type_t>(peer.tp_type);
 
       bondp_rjfr_t bondp_rjfr{};
-      bool is_bonding = dev_name.compare(0, 7, "bonding") == 0;
+      bool is_bonding = state_->device_->name().compare(0, 7, "bonding") == 0;
       if (is_bonding && state_->jfs_) {
         rjfr.flag.bs.has_drv_ext = 1;
         bondp_rjfr.base = rjfr;

@@ -243,15 +243,23 @@ static bool register_data_buffer(test_context* ctx, const test_config& cfg) {
   }
   memset(ctx->local_buf, 'x', buf_len);
 
+  // Allocate token_id for UB device (perftest register_mem:828-848).
+  // urma_alloc_token_id returns NULL if device doesn't support tokens.
+  urma_token_id_t* reg_token_id = urma_alloc_token_id(ctx->urma_ctx);
+  if (reg_token_id) {
+    ELOG_INFO << "allocated token_id for segment registration";
+  }
+
   urma_reg_seg_flag_t flag{};
   flag.bs.token_policy = URMA_TOKEN_NONE;
   flag.bs.cacheable = URMA_NON_CACHEABLE;
   flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
+  flag.bs.token_id_valid = (reg_token_id != nullptr) ? URMA_TOKEN_ID_VALID : 0;
 
   urma_seg_cfg_t seg_cfg{};
   seg_cfg.va = (uint64_t)ctx->local_buf;
   seg_cfg.len = buf_len;
-  seg_cfg.token_id = nullptr;
+  seg_cfg.token_id = reg_token_id;
   seg_cfg.token_value = {};
   seg_cfg.flag = flag;
   seg_cfg.user_ctx = (uint64_t)ctx->local_buf;

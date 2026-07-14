@@ -619,6 +619,8 @@ class urma_socket_t {
     if (write_ec) co_return write_ec;
     record_handshake_endpoints();
     close_handshake_socket();
+    // Drain JFC before starting poll (see connect_impl comment).
+    state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};
   }
@@ -932,6 +934,11 @@ class urma_socket_t {
     if (ec) co_return ec;
     record_handshake_endpoints();
     close_handshake_socket();
+    // Drain the JFC before starting timed polling, matching perftest's
+    // warmup pattern (perftest_resources.c:2667).  This ensures any CQEs
+    // from setup (e.g. recv buffer posting) are consumed before the first
+    // application SEND, and primes the hardware poll path.
+    state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};
   }

@@ -399,8 +399,11 @@ struct urma_socket_shared_state_t
     // Event-driven: check for CQ events via JFCE (non-blocking, timeout=0).
     // Matching perftest's wait_jfc_event (perftest_run_test.c:204-219).
     if (jfce_) {
+      // Blocking wait with 1ms timeout matching perftest's wait_jfc_event
+      // (perftest_run_test.c:204-219).  Using timeout=0 would return
+      // immediately even without events, defeating the purpose of JFCE.
       urma_jfc_t* ev_jfc = nullptr;
-      int ret = urma_wait_jfc(jfce_, 1, 0, &ev_jfc);
+      int ret = urma_wait_jfc(jfce_.get(), 1, 0, &ev_jfc);
       if (ret > 0 && ev_jfc == jfc_.get()) {
         // Acknowledge and rearm before polling
         uint32_t ack_cnt = 1;

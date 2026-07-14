@@ -294,7 +294,7 @@ static bool register_data_buffer(test_context* ctx, const test_config& cfg) {
 // Pack flat segment info + jetty ID for TCP exchange (matching perftest
 // seg_jetty_info_t layout, NOT raw urma_seg_t which has bitfield unions).
 struct __attribute__((packed)) handshake_info {
-  urma_eid_t eid;       // from seg.ubva.eid
+  uint8_t eid[16];      // urma_eid_t raw bytes
   uint32_t uasid;       // from seg.ubva.uasid
   uint64_t seg_va;      // from seg.ubva.va
   uint64_t seg_len;     // from seg.len
@@ -306,7 +306,7 @@ struct __attribute__((packed)) handshake_info {
 static handshake_info make_local_info(test_context* ctx) {
   handshake_info info{};
   auto s = ctx->local_tseg->seg;
-  std::memcpy(info.eid, s.ubva.eid.raw, sizeof(info.eid));
+  std::memcpy(info.eid, s.ubva.eid.raw, 16);
   info.uasid = s.ubva.uasid;
   info.seg_va = s.ubva.va;
   info.seg_len = s.len;
@@ -320,7 +320,7 @@ static bool import_remote_peer(test_context* ctx, const handshake_info& peer,
                                 const test_config& cfg) {
   // Reconstruct urma_seg_t from flat handshake fields, then import
   urma_seg_t remote_seg{};
-  std::memcpy(remote_seg.ubva.eid.raw, peer.eid, sizeof(peer.eid));
+  std::memcpy(remote_seg.ubva.eid.raw, peer.eid, 16);
   remote_seg.ubva.uasid = peer.uasid;
   remote_seg.ubva.va = peer.seg_va;
   remote_seg.len = peer.seg_len;

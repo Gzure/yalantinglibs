@@ -78,6 +78,9 @@ struct urma_deleter {
   void operator()(urma_jetty_t* value) const {
     if (value) urma_delete_jetty(value);
   }
+  void operator()(urma_jfce_t* value) const {
+    if (value) urma_delete_jfce(value);
+  }
   void operator()(urma_target_jetty_t* value) const {
     if (value) urma_unimport_jetty(value);
   }
@@ -139,29 +142,20 @@ struct urma_socket_shared_state_t
               << ", max_jfr_depth=" << cap.max_jfr_depth
               << ", max_jfs_depth=" << cap.max_jfs_depth;
 
-    // Initialize bonding device mode if applicable (mimics perftest
-    // init_device, perftest_resources.c:237-253).  Must be called before
-    // any JFC/JFR/jetty creation on bonding devices.
-    auto dev_name = device_->name();
-    if (dev_name.compare(0, 7, "bonding") == 0) {
-      static std::once_flag bonding_ctl_flag;
-      std::call_once(bonding_ctl_flag, [this]() {
-        bondp_set_bonding_mode_in_t in_arg{};
-        in_arg.bonding_mode = BONDP_BONDING_MODE_STANDALONE;
-        in_arg.bonding_level = BONDP_BONDING_LEVEL_IODIE;
-        urma_user_ctl_in_t in{};
-        in.addr = reinterpret_cast<uint64_t>(&in_arg);
-        in.len = sizeof(in_arg);
-        in.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
-        urma_user_ctl_out_t out{};
-        auto st = urma_user_ctl(device_->context(), &in, &out);
-        ELOG_DEBUG << "urma_user_ctl SET_BONDING_MODE: "
-                   << static_cast<int>(st);
-      });
+    // Create JFCE and attach to JFC (matching perftest create_jfc pattern,
+    // perftest_resources.c:371-386).  Even without explicit wait_jfc in the
+    // poll loop, creating+rearming the JFCE enables the hardware's event
+    // completion path which is required for reliable CTP SEND on bonding.
+    jfce_.reset(urma_create_jfce(device_->context()));
+    if (!jfce_) {
+      set_init_error("urma_create_jfce", errno);
+      ELOG_ERROR << "urma_create_jfce failed: errno="
+                 << init_error_.value();
     }
 
     urma_jfc_cfg_t jfc_cfg{};
     jfc_cfg.depth = static_cast<uint32_t>(cq_size);
+    jfc_cfg.jfce = jfce_.get();
     errno = 0;
     jfc_.reset(urma_create_jfc(device_->context(), &jfc_cfg));
     if (!jfc_) {
@@ -175,11 +169,13 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfc succeeded: jfc_id="
               << jfc_->jfc_id.id << ", depth=" << jfc_cfg.depth;
 
+    // Create JFR matching perftest fill_jfr_cfg (perftest_resources.c:538-555).
     urma_jfr_cfg_t jfr_cfg{};
     jfr_cfg.depth = static_cast<uint32_t>(recv_buffer_cnt_ + 1);
     jfr_cfg.trans_mode = URMA_TM_RM;
     jfr_cfg.max_sge = 1;
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+    jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
     jfr_cfg.jfc = jfc_.get();
     errno = 0;
     jfr_.reset(urma_create_jfr(device_->context(), &jfr_cfg));
@@ -196,6 +192,9 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfr succeeded: jfr_id="
               << jfr_->jfr_id.id << ", depth=" << jfr_cfg.depth;
 
+    // Jetty creation matching perftest create_jetty with share_jfr=true
+    // (perftest_resources.c:616-629).  JFS config mirrors fill_jfs_cfg
+    // (lines 511-536), JFR is shared via jetty_cfg.shared.
     urma_jetty_cfg_t jetty_cfg{};
     jetty_cfg.flag.bs.share_jfr = 1;
     jetty_cfg.jfs_cfg.depth =
@@ -203,6 +202,7 @@ struct urma_socket_shared_state_t
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
     jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
     jetty_cfg.jfs_cfg.max_sge = 1;
+    jetty_cfg.jfs_cfg.max_rsge = 1;
     jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
     jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
     jetty_cfg.jfs_cfg.jfc = jfc_.get();
@@ -394,6 +394,11 @@ struct urma_socket_shared_state_t
 
   void poll_once() {
     if (has_close_) return;
+    // Rearm JFCE before polling so the event channel is armed and ready
+    // to notify new completions after the current poll cycle.
+    if (jfce_) {
+      urma_rearm_jfc(jfc_.get(), false);
+    }
     auto [poll_ec, completion_count] = poll_completion();
     if (poll_ec) {
       fail_pending(poll_ec);
@@ -462,6 +467,7 @@ struct urma_socket_shared_state_t
     remote_seg_.reset();
     remote_jetty_.reset();
     jetty_.reset();
+    jfce_.reset();
     jfr_.reset();
     jfc_.reset();
   }
@@ -473,6 +479,7 @@ struct urma_socket_shared_state_t
   std::unique_ptr<urma_jfc_t, urma_deleter> jfc_;
   std::unique_ptr<urma_jfr_t, urma_deleter> jfr_;
   std::unique_ptr<urma_jetty_t, urma_deleter> jetty_;
+  std::unique_ptr<urma_jfce_t, urma_deleter> jfce_;
   std::unique_ptr<urma_target_jetty_t, urma_deleter> remote_jetty_;
   std::unique_ptr<urma_target_seg_t, urma_deleter> remote_seg_;
   std::size_t recv_buffer_cnt_;

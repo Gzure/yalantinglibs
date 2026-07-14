@@ -81,9 +81,6 @@ struct urma_deleter {
   void operator()(urma_jfce_t* value) const {
     if (value) urma_delete_jfce(value);
   }
-  void operator()(urma_jfs_t* value) const {
-    if (value) urma_delete_jfs(value);
-  }
   void operator()(urma_target_jetty_t* value) const {
     if (value) urma_unimport_jetty(value);
   }
@@ -230,29 +227,6 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jetty succeeded: jetty_id="
               << jetty_->jetty_id.id << ", uasid="
               << jetty_->jetty_id.uasid;
-
-    // Create separate JFS for bonding JFR import (perftest create_jfs:441-453).
-    // The bonding driver needs the JFS pointer in bondp_rjfr_t when importing
-    // the remote JFR with has_drv_ext.  Without this, the JFR import fails to
-    // establish the routing path from local JFS to remote JFR.
-    if (device_->name().compare(0, 7, "bonding") == 0) {
-      urma_jfs_cfg_t jfs_cfg{};
-      jfs_cfg.depth = static_cast<uint32_t>(send_buffer_cnt + 2);
-      jfs_cfg.trans_mode = URMA_TM_RM;
-      jfs_cfg.priority = URMA_MAX_PRIORITY;
-      jfs_cfg.max_sge = 1;
-      jfs_cfg.max_rsge = 1;
-      jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-      jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-      jfs_cfg.jfc = jfc_.get();
-      jfs_.reset(urma_create_jfs(device_->context(), &jfs_cfg));
-      if (!jfs_) {
-        ELOG_WARN << "urma_create_jfs failed (separate JFS is optional)";
-      } else {
-        ELOG_INFO << "urma_create_jfs succeeded for bonding JFR import";
-      }
-    }
-
     return true;
   }
 
@@ -491,13 +465,8 @@ struct urma_socket_shared_state_t
       device_->get_buffer_pool()->return_buffer(buffer);
     }
     remote_seg_.reset();
-    if (remote_jfr_) {
-      urma_unimport_jfr(remote_jfr_);
-      remote_jfr_ = nullptr;
-    }
     remote_jetty_.reset();
     jetty_.reset();
-    jfs_.reset();
     jfce_.reset();
     jfr_.reset();
     jfc_.reset();
@@ -511,10 +480,9 @@ struct urma_socket_shared_state_t
   std::unique_ptr<urma_jfr_t, urma_deleter> jfr_;
   std::unique_ptr<urma_jetty_t, urma_deleter> jetty_;
   std::unique_ptr<urma_jfce_t, urma_deleter> jfce_;
-  std::unique_ptr<urma_jfs_t, urma_deleter> jfs_;
   std::unique_ptr<urma_target_jetty_t, urma_deleter> remote_jetty_;
   std::unique_ptr<urma_target_seg_t, urma_deleter> remote_seg_;
-  urma_target_jetty_t* remote_jfr_ = nullptr;
+  std::size_t recv_buffer_cnt_;
   std::size_t recv_buffer_cnt_;
   circle_buffer<urma_buffer_t> recv_queue_;
   circle_buffer<pending_recv> recv_result_;
@@ -896,37 +864,6 @@ class urma_socket_t {
     } else {
       ELOG_INFO << "urma_import_seg succeeded for peer EID="
                 << eid_to_address(peer.eid).to_string();
-    }
-
-    // Import remote JFR (perftest connect_jfr_default:1514-1560).
-    // This establishes routing from local JFS to remote JFR.  Must come
-    // before import_jetty.  For bonding devices, pass has_drv_ext and
-    // the JFS pointer via bondp_rjfr_t.
-    {
-      urma_token_t jfr_token{};
-      urma_rjfr_t rjfr{};
-      rjfr.jfr_id.eid = remote.jetty_id.eid;
-      rjfr.jfr_id.uasid = remote.jetty_id.uasid;
-      rjfr.jfr_id.id = peer.jetty_id;
-      rjfr.trans_mode = URMA_TM_RM;
-      rjfr.tp_type = static_cast<urma_tp_type_t>(peer.tp_type);
-
-      bondp_rjfr_t bondp_rjfr{};
-      bool is_bonding = state_->device_->name().compare(0, 7, "bonding") == 0;
-      if (is_bonding && state_->jfs_) {
-        rjfr.flag.bs.has_drv_ext = 1;
-        bondp_rjfr.base = rjfr;
-        bondp_rjfr.jfs = state_->jfs_.get();
-      }
-
-      state_->remote_jfr_ = urma_import_jfr(
-          state_->device_->context(),
-          is_bonding && state_->jfs_ ? &bondp_rjfr.base : &rjfr,
-          &jfr_token);
-      if (!state_->remote_jfr_) {
-        ELOG_WARN << "urma_import_jfr failed: errno=" << errno
-                  << ", continuing without remote JFR";
-      }
     }
 
     urma_token_t token{};

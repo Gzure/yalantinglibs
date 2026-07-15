@@ -576,7 +576,7 @@ struct urma_socket_shared_state_t
   std::error_code init_error_;
 };
 
-}  // namespace detail
+}; // namespace detail
 
 class urma_socket_t {
  public:

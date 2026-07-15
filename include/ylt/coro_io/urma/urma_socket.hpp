@@ -192,6 +192,53 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfr succeeded: jfr_id="
               << jfr_->jfr_id.id << ", depth=" << jfr_cfg.depth;
 
+    // Query bonding active port count and adjust JFR depth, matching
+    // perftest's get_rqe_prefill_multiple_simplex (perftest_run_test.c:146-172).
+    // The virtual JFR depth must accommodate all active ports; otherwise
+    // urma_post_jetty_recv_wr returns ENOMEM when the virtual WR buffer fills.
+    uint32_t rqe_multiple = 1;
+    auto dev_name = device_->name();
+    if (dev_name.compare(0, 7, "bonding") == 0) {
+      bondp_query_port_in_t qin{};
+      qin.jfr = jfr_.get();
+      bondp_query_port_out_t qout{};
+      urma_user_ctl_in_t uin{};
+      uin.addr = reinterpret_cast<uint64_t>(&qin);
+      uin.len = sizeof(qin);
+      uin.opcode = BONDP_USER_CTL_QUERY_PORT;
+      urma_user_ctl_out_t uout{};
+      uout.addr = reinterpret_cast<uint64_t>(&qout);
+      uout.len = sizeof(qout);
+      if (urma_user_ctl(device_->context(), &uin, &uout) == URMA_SUCCESS &&
+          qout.active_count > 1) {
+        rqe_multiple = qout.active_count;
+        ELOG_INFO << "Bonding device active port count=" << rqe_multiple
+                  << ", recreating JFR with depth="
+                  << (recv_buffer_cnt_ + 1) << " * " << rqe_multiple << " = "
+                  << ((recv_buffer_cnt_ + 1) * rqe_multiple);
+        // Delete and recreate JFR with multiplied depth so the virtual JFR
+        // can hold enough recv WRs for all active ports.
+        jfr_.reset();
+        jfr_cfg.depth = static_cast<uint32_t>(
+            (recv_buffer_cnt_ + 1) * rqe_multiple);
+        errno = 0;
+        jfr_.reset(urma_create_jfr(device_->context(), &jfr_cfg));
+        if (!jfr_) {
+          set_init_error("urma_create_jfr(bonding)", errno);
+          ELOG_ERROR << "urma_create_jfr(bonding) failed: depth="
+                     << jfr_cfg.depth
+                     << ", errno=" << init_error_.value()
+                     << ", error=" << init_error_.message();
+          return false;
+        }
+        ELOG_INFO << "urma_create_jfr(bonding) succeeded: jfr_id="
+                  << jfr_->jfr_id.id << ", depth=" << jfr_cfg.depth;
+      } else if (qout.active_count == 0) {
+        ELOG_WARN << "Bonding device query returned active_count=0, using "
+                     "rqe_multiple=1";
+      }
+    }
+
     // Jetty creation matching perftest create_jetty with share_jfr=true
     // (perftest_resources.c:616-629).  JFS config mirrors fill_jfs_cfg
     // (lines 511-536), JFR is shared via jetty_cfg.shared.
@@ -228,37 +275,13 @@ struct urma_socket_shared_state_t
               << jetty_->jetty_id.id << ", uasid="
               << jetty_->jetty_id.uasid;
 
-    // Query bonding active port count to multiply RQE prefill, matching
-    // perftest's get_rqe_prefill_multiple_duplex (perftest_run_test.c:175-201).
-    // The bonding device needs to issue RQE for each active port multiple.
-    uint32_t rqe_multiple = 1;
-    auto dev_name = device_->name();
-    if (dev_name.compare(0, 7, "bonding") == 0) {
-      bondp_query_port_in_t qin{};
-      qin.jetty = jetty_.get();
-      bondp_query_port_out_t qout{};
-      urma_user_ctl_in_t uin{};
-      uin.addr = reinterpret_cast<uint64_t>(&qin);
-      uin.len = sizeof(qin);
-      uin.opcode = BONDP_USER_CTL_QUERY_PORT;
-      urma_user_ctl_out_t uout{};
-      uout.addr = reinterpret_cast<uint64_t>(&qout);
-      uout.len = sizeof(qout);
-      if (urma_user_ctl(device_->context(), &uin, &uout) == URMA_SUCCESS &&
-          qout.active_count > 0) {
-        rqe_multiple = qout.active_count;
-        ELOG_INFO << "Bonding device active port count=" << rqe_multiple
-                  << ", multiplying recv_buffer_cnt from "
-                  << recv_buffer_cnt_ << " to "
-                  << (recv_buffer_cnt_ * rqe_multiple);
-      } else {
-        ELOG_WARN << "Failed to query bonding active port count, using "
-                     "rqe_multiple=1";
-      }
-    }
+    // Multiply recv_buffer_cnt_ by rqe_multiple so fill_recv_queue posts
+    // enough recv WRs to cover all bonding active ports.
     recv_buffer_cnt_ *= rqe_multiple;
-    // Resize recv_queue_ to accommodate the multiplied recv buffer count.
-    recv_queue_ = circle_buffer<urma_buffer_t>(recv_buffer_cnt_ + 1);
+    if (rqe_multiple > 1) {
+      // Resize recv_queue_ to accommodate the multiplied recv buffer count.
+      recv_queue_ = circle_buffer<urma_buffer_t>(recv_buffer_cnt_ + 1);
+    }
 
     return true;
   }

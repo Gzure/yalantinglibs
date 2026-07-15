@@ -169,60 +169,32 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfc succeeded: jfc_id="
               << jfc_->jfc_id.id << ", depth=" << jfc_cfg.depth;
 
-    // Query bonding active port count BEFORE creating the JFR, using a
-    // temporary minimal JFR.  Even in standalone mode we query to diagnose
-    // CTP spray vs recv port mismatch — the hardware may have multiple
-    // physical ports that CTP delivers to regardless of bonding mode.
+    // For bonding devices, use a conservative JFR depth multiplier.  perftest
+    // uses jfr_depth=512 (64x our default of 8) and never hits RNR.  The
+    // bonding driver's WR buffer is sized depth*enabled_count, and CTP may
+    // need extra headroom for internal health-check or multi-path delivery.
+    // We cannot query the active port count via temp JFR (bonding driver
+    // rejects creation of a second JFR on the same context), so use a fixed
+    // multiplier that provides enough headroom without wasting resources.
     uint32_t rqe_multiple = 1;
     auto dev_name = device_->name();
     if (dev_name.compare(0, 7, "bonding") == 0) {
       auto* ctx = device_->context();
-      const auto& dev_attr = device_->attr();
       ELOG_INFO << "Bonding device detected: name=" << dev_name
                 << ", aggr_mode=" << static_cast<int>(ctx->aggr_mode)
                 << " (0=standalone, 1=active_backup, 2=balance)"
-                << ", hw_port_cnt=" << static_cast<int>(dev_attr.port_cnt);
-      urma_jfr_cfg_t query_cfg{};
-      query_cfg.depth = 2;  // depth=1 may fail on bonding
-      query_cfg.trans_mode = URMA_TM_RM;
-      query_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-      query_cfg.jfc = jfc_.get();
-      urma_jfr_t* query_jfr =
-          urma_create_jfr(device_->context(), &query_cfg);
-      if (query_jfr) {
-        bondp_query_port_in_t qin{};
-        qin.jfr = query_jfr;
-        bondp_query_port_out_t qout{};
-        urma_user_ctl_in_t uin{};
-        uin.addr = reinterpret_cast<uint64_t>(&qin);
-        uin.len = sizeof(qin);
-        uin.opcode = BONDP_USER_CTL_QUERY_PORT;
-        urma_user_ctl_out_t uout{};
-        uout.addr = reinterpret_cast<uint64_t>(&qout);
-        uout.len = sizeof(qout);
-        if (urma_user_ctl(device_->context(), &uin, &uout) == URMA_SUCCESS) {
-          ELOG_INFO << "Bonding port query: active_count=" << qout.active_count
-                    << ", enabled_count=" << qout.enabled_count
-                    << " (recv WRs spread across this many ports)";
-          if (qout.active_count > 1) {
-            rqe_multiple = qout.active_count;
-            ELOG_INFO << "Bonding multiplier: JFR depth=" << (recv_buffer_cnt_ + 1)
-                      << " * " << rqe_multiple << " = "
-                      << ((recv_buffer_cnt_ + 1) * rqe_multiple);
-          }
-        } else {
-          ELOG_WARN << "Bonding port query failed, using rqe_multiple=1";
-        }
-        urma_delete_jfr(query_jfr);
-      } else {
-        ELOG_WARN << "Failed to create query JFR for bonding port count, "
-                     "errno=" << errno << ", using rqe_multiple=1";
-      }
+                << ", hw_port_cnt="
+                << static_cast<int>(device_->attr().port_cnt);
+      // Use 8x multiplier: perftest depth=512 vs yalanting default=33,
+      // 33*8=264 gives comparable headroom for CTP on bonding hardware.
+      rqe_multiple = 8;
+      ELOG_INFO << "Bonding JFR depth multiplier: " << rqe_multiple
+                << "x, effective depth="
+                << ((recv_buffer_cnt_ + 1) * rqe_multiple);
     }
 
     // Create JFR matching perftest fill_jfr_cfg (perftest_resources.c:538-555).
-    // Depth is multiplied by rqe_multiple for bonding devices so the virtual
-    // JFR can hold enough recv WRs for all active ports.
+    // Depth is multiplied by rqe_multiple for bonding devices.
     urma_jfr_cfg_t jfr_cfg{};
     jfr_cfg.depth = static_cast<uint32_t>(
         (recv_buffer_cnt_ + 1) * rqe_multiple);
@@ -314,12 +286,21 @@ struct urma_socket_shared_state_t
   }
 
   std::error_code fill_recv_queue() {
+    auto before = recv_queue_.size();
     while (recv_queue_.size() < recv_buffer_cnt_) {
       auto buffer = device_->get_buffer_pool()->get_buffer();
       if (!buffer) return std::make_error_code(std::errc::no_buffer_space);
       auto ec = post_recv(std::move(buffer));
-      if (ec) return ec;
+      if (ec) {
+        ELOG_ERROR << "fill_recv_queue post_recv failed: " << ec.message()
+                   << ", posted=" << (recv_queue_.size() - before)
+                   << ", target=" << recv_buffer_cnt_;
+        return ec;
+      }
     }
+    ELOG_INFO << "fill_recv_queue done: posted=" << (recv_queue_.size() - before)
+              << ", total=" << recv_queue_.size()
+              << ", target=" << recv_buffer_cnt_; 
     return {};
   }
 

@@ -192,7 +192,7 @@ struct urma_socket_shared_state_t
     jetty_cfg.jfs_cfg.depth =
         static_cast<uint32_t>(send_buffer_cnt + 2);
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
-    jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
+    jetty_cfg.jfs_cfg.priority = 6;
     jetty_cfg.jfs_cfg.max_sge = 1;
     jetty_cfg.jfs_cfg.max_rsge = 1;
     jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
@@ -641,8 +641,7 @@ class urma_socket_t {
     if (write_ec) co_return write_ec;
     record_handshake_endpoints();
     close_handshake_socket();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    for (int i = 0; i < 5; i++) state_->poll_once();
+    for (int i = 0; i < 20; i++) state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};
   }
@@ -953,8 +952,7 @@ class urma_socket_t {
     if (ec) co_return ec;
     record_handshake_endpoints();
     close_handshake_socket();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    for (int i = 0; i < 5; i++) state_->poll_once();
+    for (int i = 0; i < 20; i++) state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};
   }

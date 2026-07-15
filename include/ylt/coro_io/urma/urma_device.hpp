@@ -246,6 +246,11 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name, int eid_
     uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
     urma_user_ctl_out_t uout{};
     urma_user_ctl(context_, &uin, &uout);
+
+    uin.opcode = BONDP_USER_CTL_DISABLE_MSN;
+    uin.addr = 0;
+    uin.len = 0;
+    urma_user_ctl(context_, &uin, &uout);
   }
 
   auto default_pool_config = urma_buffer_pool_config_t{};

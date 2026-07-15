@@ -142,16 +142,8 @@ struct urma_socket_shared_state_t
               << ", max_jfr_depth=" << cap.max_jfr_depth
               << ", max_jfs_depth=" << cap.max_jfs_depth;
 
-    jfce_.reset(urma_create_jfce(device_->context()));
-    if (!jfce_) {
-      set_init_error("urma_create_jfce", errno);
-      ELOG_ERROR << "urma_create_jfce failed: errno="
-                 << init_error_.value();
-    }
-
     urma_jfc_cfg_t jfc_cfg{};
     jfc_cfg.depth = static_cast<uint32_t>(cq_size);
-    jfc_cfg.jfce = jfce_.get();
     errno = 0;
     jfc_.reset(urma_create_jfc(device_->context(), &jfc_cfg));
     if (!jfc_) {
@@ -395,10 +387,6 @@ struct urma_socket_shared_state_t
   }
 
   void start_polling() {
-    // Rearm JFCE so the event channel is ready for the next poll cycle.
-    if (jfce_) {
-      urma_rearm_jfc(jfc_.get(), false);
-    }
     auto self = shared_from_this();
     poll_timer_.expires_after(idle_poll_interval_);
     poll_timer_.async_wait([self](const std::error_code& ec) {
@@ -409,19 +397,6 @@ struct urma_socket_shared_state_t
 
   void poll_once() {
     if (has_close_) return;
-
-    if (jfce_) {
-      urma_jfc_t* ev_jfc = nullptr;
-      int ret = urma_wait_jfc(jfce_.get(), 1, 1, &ev_jfc);
-      if (ret > 0 && ev_jfc == jfc_.get()) {
-        // Acknowledge and rearm before polling
-        uint32_t ack_cnt = 1;
-        urma_ack_jfc(&ev_jfc, &ack_cnt, 1);
-      }
-      // Rearm regardless (rearm is idempotent, matching perftest's
-      // rearm_jfc called before the poll loop).
-      urma_rearm_jfc(jfc_.get(), false);
-    }
 
     auto [poll_ec, completion_count] = poll_completion();
     if (poll_ec) {

@@ -142,10 +142,6 @@ struct urma_socket_shared_state_t
               << ", max_jfr_depth=" << cap.max_jfr_depth
               << ", max_jfs_depth=" << cap.max_jfs_depth;
 
-    // Create JFCE and attach to JFC (matching perftest create_jfc pattern,
-    // perftest_resources.c:371-386).  Even without explicit wait_jfc in the
-    // poll loop, creating+rearming the JFCE enables the hardware's event
-    // completion path which is required for reliable CTP SEND on bonding.
     jfce_.reset(urma_create_jfce(device_->context()));
     if (!jfce_) {
       set_init_error("urma_create_jfce", errno);
@@ -169,33 +165,13 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfc succeeded: jfc_id="
               << jfc_->jfc_id.id << ", depth=" << jfc_cfg.depth;
 
-    // For bonding devices, use a conservative JFR depth multiplier.  perftest
-    // uses jfr_depth=512 (64x our default of 8) and never hits RNR.  The
-    // bonding driver's WR buffer is sized depth*enabled_count, and CTP may
-    // need extra headroom for internal health-check or multi-path delivery.
-    // We cannot query the active port count via temp JFR (bonding driver
-    // rejects creation of a second JFR on the same context), so use a fixed
-    // multiplier that provides enough headroom without wasting resources.
-    uint32_t rqe_multiple = 1;
-    auto dev_name = device_->name();
-    if (dev_name.compare(0, 7, "bonding") == 0) {
-      auto* ctx = device_->context();
-      ELOG_INFO << "Bonding device detected: name=" << dev_name
-                << ", aggr_mode=" << static_cast<int>(ctx->aggr_mode)
-                << " (0=standalone, 1=active_backup, 2=balance)"
-                << ", hw_port_cnt="
-                << static_cast<int>(device_->attr().port_cnt);
-      // Use 8x multiplier: perftest depth=512 vs yalanting default=33,
-      // 33*8=264 gives comparable headroom for CTP on bonding hardware.
-      rqe_multiple = 8;
-      ELOG_INFO << "Bonding JFR depth multiplier: " << rqe_multiple
-                << "x, effective depth="
-                << ((recv_buffer_cnt_ + 1) * rqe_multiple);
-    }
+	    uint32_t rqe_multiple = 1;
+	    auto dev_name = device_->name();
+	    if (dev_name.compare(0, 7, "bonding") == 0) {
+	      rqe_multiple = 8;
+	    }
 
-    // Create JFR matching perftest fill_jfr_cfg (perftest_resources.c:538-555).
-    // Depth is multiplied by rqe_multiple for bonding devices.
-    urma_jfr_cfg_t jfr_cfg{};
+	    urma_jfr_cfg_t jfr_cfg{};
     jfr_cfg.depth = static_cast<uint32_t>(
         (recv_buffer_cnt_ + 1) * rqe_multiple);
     jfr_cfg.trans_mode = URMA_TM_RM;
@@ -218,9 +194,6 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfr succeeded: jfr_id="
               << jfr_->jfr_id.id << ", depth=" << jfr_cfg.depth;
 
-    // Jetty creation matching perftest create_jetty with share_jfr=true
-    // (perftest_resources.c:616-629).  JFS config mirrors fill_jfs_cfg
-    // (lines 511-536), JFR is shared via jetty_cfg.shared.
     urma_jetty_cfg_t jetty_cfg{};
     jetty_cfg.flag.bs.share_jfr = 1;
     jetty_cfg.jfs_cfg.depth =
@@ -254,11 +227,8 @@ struct urma_socket_shared_state_t
               << jetty_->jetty_id.id << ", uasid="
               << jetty_->jetty_id.uasid;
 
-    // Multiply recv_buffer_cnt_ by rqe_multiple so fill_recv_queue posts
-    // enough recv WRs to cover all bonding active ports.
     recv_buffer_cnt_ *= rqe_multiple;
     if (rqe_multiple > 1) {
-      // Resize recv_queue_ to accommodate the multiplied recv buffer count.
       recv_queue_ = circle_buffer<urma_buffer_t>(recv_buffer_cnt_ + 1);
     }
 
@@ -367,14 +337,6 @@ struct urma_socket_shared_state_t
         auto ec = cr.status == URMA_CR_SUCCESS
                       ? std::error_code{}
                       : std::make_error_code(std::errc::io_error);
-        ELOG_INFO << "URMA CR: status=" << static_cast<int>(cr.status)
-                  << ", dir=" << (cr.flag.bs.s_r ? "recv" : "send")
-                  << ", opcode=" << static_cast<int>(cr.opcode)
-                  << ", len=" << cr.completion_len
-                  << ", ctx=" << cr.user_ctx
-                  << ", lid=" << cr.local_id
-                  << ", rid=" << cr.remote_id.id
-                  << ", jetty=" << static_cast<int>(cr.flag.bs.jetty);
         if (ec) {
           ELOG_ERROR << "URMA completion failed: status="
                      << static_cast<int>(cr.status)
@@ -448,10 +410,6 @@ struct urma_socket_shared_state_t
   void poll_once() {
     if (has_close_) return;
 
-    // Event-driven: check for CQ events via JFCE with 1ms blocking wait.
-    // Matching perftest's wait_jfc_event (perftest_run_test.c:204-219).
-    // The JFCE event completion path is required for reliable CTP SEND on
-    // bonding; using timeout=0 skips event processing entirely.
     if (jfce_) {
       urma_jfc_t* ev_jfc = nullptr;
       int ret = urma_wait_jfc(jfce_.get(), 1, 1, &ev_jfc);
@@ -688,7 +646,6 @@ class urma_socket_t {
     if (write_ec) co_return write_ec;
     record_handshake_endpoints();
     close_handshake_socket();
-    // Drain JFC before starting poll (see connect_impl comment).
     state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};
@@ -935,11 +892,6 @@ class urma_socket_t {
     urma_token_t token{};
     errno = 0;
 
-    // For bonding devices in RM mode, pass has_drv_ext and the local jetty
-    // pointer via bondp_rjetty_t so the bonding driver (bondp_import_jetty)
-    // establishes the virtual connection routing table.  Without this, the
-    // bonding layer cannot route SENDs to the correct physical device,
-    // causing the first SEND to be rejected with status=10.
     auto dev_name = state_->device_->name();
     if (dev_name.compare(0, 7, "bonding") == 0 &&
         remote.trans_mode == URMA_TM_RM) {
@@ -1005,10 +957,6 @@ class urma_socket_t {
     if (ec) co_return ec;
     record_handshake_endpoints();
     close_handshake_socket();
-    // Drain the JFC before starting timed polling, matching perftest's
-    // warmup pattern (perftest_resources.c:2667).  This ensures any CQEs
-    // from setup (e.g. recv buffer posting) are consumed before the first
-    // application SEND, and primes the hardware poll path.
     state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};

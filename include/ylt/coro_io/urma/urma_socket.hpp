@@ -182,24 +182,6 @@ struct urma_socket_shared_state_t
                 << ", aggr_mode=" << static_cast<int>(ctx->aggr_mode)
                 << " (0=standalone, 1=active_backup, 2=balance)"
                 << ", hw_port_cnt=" << static_cast<int>(dev_attr.port_cnt);
-
-      // Set bonding mode matching perftest init_device (perftest_resources.c:237).
-      // Even when values match defaults this ensures the bonding driver's
-      // internal topology state is consistent with hardware.
-      bondp_set_bonding_mode_in_t mode_in{};
-      mode_in.bonding_mode = static_cast<bondp_bonding_mode_t>(ctx->aggr_mode);
-      mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
-      urma_user_ctl_in_t mode_uin{};
-      mode_uin.addr = reinterpret_cast<uint64_t>(&mode_in);
-      mode_uin.len = sizeof(mode_in);
-      mode_uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
-      urma_user_ctl_out_t mode_uout{};
-      auto mode_ret = urma_user_ctl(ctx, &mode_uin, &mode_uout);
-      ELOG_INFO << "BONDP_USER_CTL_SET_BONDING_MODE: mode="
-                << static_cast<int>(mode_in.bonding_mode)
-                << ", level=" << static_cast<int>(mode_in.bonding_level)
-                << ", ret=" << static_cast<int>(mode_ret);
-
       urma_jfr_cfg_t query_cfg{};
       query_cfg.depth = 2;  // depth=1 may fail on bonding
       query_cfg.trans_mode = URMA_TM_RM;
@@ -881,6 +863,29 @@ class urma_socket_t {
       ELOG_WARN << "URMA device capability does not report RM RTP support; "
                    "continuing and relying on resource creation";
     }
+
+    // Set bonding mode BEFORE creating any URMA resources, matching
+    // perftest init_device (perftest_resources.c:237-253).  Must be called
+    // before urma_create_jfc/jfr/jetty, otherwise the bonding context
+    // ref count is > 1 and the driver returns URMA_EAGAIN.
+    auto dev_name = device->name();
+    if (dev_name.compare(0, 7, "bonding") == 0) {
+      auto* ctx = device->context();
+      bondp_set_bonding_mode_in_t mode_in{};
+      mode_in.bonding_mode = static_cast<bondp_bonding_mode_t>(ctx->aggr_mode);
+      mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
+      urma_user_ctl_in_t mode_uin{};
+      mode_uin.addr = reinterpret_cast<uint64_t>(&mode_in);
+      mode_uin.len = sizeof(mode_in);
+      mode_uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
+      urma_user_ctl_out_t mode_uout{};
+      auto mode_ret = urma_user_ctl(ctx, &mode_uin, &mode_uout);
+      ELOG_INFO << "BONDP_USER_CTL_SET_BONDING_MODE(before resource init): "
+                << "mode=" << static_cast<int>(mode_in.bonding_mode)
+                << ", level=" << static_cast<int>(mode_in.bonding_level)
+                << ", ret=" << static_cast<int>(mode_ret);
+    }
+
     buffer_size_ = std::min<uint32_t>(
         conf_.buffer_size, device->get_buffer_pool()->buffer_size());
     state_ = std::make_shared<detail::urma_socket_shared_state_t>(

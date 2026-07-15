@@ -238,18 +238,17 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name, int eid_
 
   if (name_.compare(0, 7, "bonding") == 0) {
     bondp_set_bonding_mode_in_t mode_in{};
-    mode_in.bonding_mode = BONDP_BONDING_MODE_BALANCE;
-    mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
     urma_user_ctl_in_t uin{};
+    urma_user_ctl_out_t uout{};
     uin.addr = reinterpret_cast<uint64_t>(&mode_in);
     uin.len = sizeof(mode_in);
     uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
-    urma_user_ctl_out_t uout{};
+
+    mode_in.bonding_mode = BONDP_BONDING_MODE_STANDALONE;
+    mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
     urma_user_ctl(context_, &uin, &uout);
 
-    uin.opcode = BONDP_USER_CTL_DISABLE_MSN;
-    uin.addr = 0;
-    uin.len = 0;
+    mode_in.bonding_mode = BONDP_BONDING_MODE_BALANCE;
     urma_user_ctl(context_, &uin, &uout);
   }
 

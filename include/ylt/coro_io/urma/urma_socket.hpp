@@ -176,6 +176,10 @@ struct urma_socket_shared_state_t
     uint32_t rqe_multiple = 1;
     auto dev_name = device_->name();
     if (dev_name.compare(0, 7, "bonding") == 0) {
+      auto* ctx = device_->context();
+      ELOG_INFO << "Bonding device detected: name=" << dev_name
+                << ", aggr_mode=" << static_cast<int>(ctx->aggr_mode)
+                << " (0=standalone, 1=active_backup, 2=balance)";
       urma_jfr_cfg_t query_cfg{};
       query_cfg.depth = 1;
       query_cfg.trans_mode = URMA_TM_RM;

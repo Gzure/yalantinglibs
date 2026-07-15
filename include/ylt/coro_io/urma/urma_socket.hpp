@@ -170,52 +170,53 @@ struct urma_socket_shared_state_t
               << jfc_->jfc_id.id << ", depth=" << jfc_cfg.depth;
 
     // Query bonding active port count BEFORE creating the JFR, using a
-    // temporary minimal JFR.  Only needed for non-standalone bonding modes
-    // (active_backup/balance) where the WR buffer size = depth * enabled_count
-    // and we must provide enough depth for all active ports.  Standalone mode
-    // uses bondp_post_recv_wr_no_store with no WR buffer limit.
+    // temporary minimal JFR.  Even in standalone mode we query to diagnose
+    // CTP spray vs recv port mismatch — the hardware may have multiple
+    // physical ports that CTP delivers to regardless of bonding mode.
     uint32_t rqe_multiple = 1;
     auto dev_name = device_->name();
     if (dev_name.compare(0, 7, "bonding") == 0) {
       auto* ctx = device_->context();
+      const auto& dev_attr = device_->attr();
       ELOG_INFO << "Bonding device detected: name=" << dev_name
                 << ", aggr_mode=" << static_cast<int>(ctx->aggr_mode)
-                << " (0=standalone, 1=active_backup, 2=balance)";
-      if (ctx->aggr_mode != URMA_AGGR_MODE_STANDALONE) {
-        urma_jfr_cfg_t query_cfg{};
-        query_cfg.depth = 1;
-        query_cfg.trans_mode = URMA_TM_RM;
-        query_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-        query_cfg.jfc = jfc_.get();
-        urma_jfr_t* query_jfr =
-            urma_create_jfr(device_->context(), &query_cfg);
-        if (query_jfr) {
-          bondp_query_port_in_t qin{};
-          qin.jfr = query_jfr;
-          bondp_query_port_out_t qout{};
-          urma_user_ctl_in_t uin{};
-          uin.addr = reinterpret_cast<uint64_t>(&qin);
-          uin.len = sizeof(qin);
-          uin.opcode = BONDP_USER_CTL_QUERY_PORT;
-          urma_user_ctl_out_t uout{};
-          uout.addr = reinterpret_cast<uint64_t>(&qout);
-          uout.len = sizeof(qout);
-          if (urma_user_ctl(device_->context(), &uin, &uout) == URMA_SUCCESS &&
-              qout.active_count > 1) {
+                << " (0=standalone, 1=active_backup, 2=balance)"
+                << ", hw_port_cnt=" << static_cast<int>(dev_attr.port_cnt);
+      urma_jfr_cfg_t query_cfg{};
+      query_cfg.depth = 2;  // depth=1 may fail on bonding
+      query_cfg.trans_mode = URMA_TM_RM;
+      query_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
+      query_cfg.jfc = jfc_.get();
+      urma_jfr_t* query_jfr =
+          urma_create_jfr(device_->context(), &query_cfg);
+      if (query_jfr) {
+        bondp_query_port_in_t qin{};
+        qin.jfr = query_jfr;
+        bondp_query_port_out_t qout{};
+        urma_user_ctl_in_t uin{};
+        uin.addr = reinterpret_cast<uint64_t>(&qin);
+        uin.len = sizeof(qin);
+        uin.opcode = BONDP_USER_CTL_QUERY_PORT;
+        urma_user_ctl_out_t uout{};
+        uout.addr = reinterpret_cast<uint64_t>(&qout);
+        uout.len = sizeof(qout);
+        if (urma_user_ctl(device_->context(), &uin, &uout) == URMA_SUCCESS) {
+          ELOG_INFO << "Bonding port query: active_count=" << qout.active_count
+                    << ", enabled_count=" << qout.enabled_count
+                    << " (recv WRs spread across this many ports)";
+          if (qout.active_count > 1) {
             rqe_multiple = qout.active_count;
-            ELOG_INFO << "Bonding device active port count=" << rqe_multiple
-                      << ", JFR depth=" << (recv_buffer_cnt_ + 1) << " * "
-                      << rqe_multiple << " = "
+            ELOG_INFO << "Bonding multiplier: JFR depth=" << (recv_buffer_cnt_ + 1)
+                      << " * " << rqe_multiple << " = "
                       << ((recv_buffer_cnt_ + 1) * rqe_multiple);
-          } else if (qout.active_count == 0) {
-            ELOG_WARN << "Bonding device query returned active_count=0, using "
-                         "rqe_multiple=1";
           }
-          urma_delete_jfr(query_jfr);
         } else {
-          ELOG_WARN << "Failed to create query JFR for bonding port count, "
-                       "errno=" << errno << ", using rqe_multiple=1";
+          ELOG_WARN << "Bonding port query failed, using rqe_multiple=1";
         }
+        urma_delete_jfr(query_jfr);
+      } else {
+        ELOG_WARN << "Failed to create query JFR for bonding port count, "
+                     "errno=" << errno << ", using rqe_multiple=1";
       }
     }
 

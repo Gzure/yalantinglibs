@@ -681,6 +681,12 @@ class urma_socket_t {
     ec = state_->fill_recv_queue();
     if (ec) co_return ec;
 
+    // Diagnostic: poll immediately after posting recv WRs to detect any
+    // unexpected completions (e.g. bonding health-check or CTP setup)
+    // that may consume recv buffers before the first application send.
+    ELOG_INFO << "Diagnostic poll after fill_recv_queue (accept)";
+    state_->poll_once();
+
     auto local_info = make_local_info();
     struct_pack::serialize_to(bytes.data(), size, local_info);
     auto [write_ec, ignored_write] =
@@ -1009,6 +1015,11 @@ class urma_socket_t {
   async_simple::coro::Lazy<std::error_code> connect_impl() {
     auto ec = state_->fill_recv_queue();
     if (ec) co_return ec;
+
+    // Diagnostic poll matching accept() side.
+    ELOG_INFO << "Diagnostic poll after fill_recv_queue (connect)";
+    state_->poll_once();
+
     auto local_info = make_local_info();
     constexpr auto size = struct_pack::get_needed_size(local_info);
     std::array<char, size.size()> bytes{};

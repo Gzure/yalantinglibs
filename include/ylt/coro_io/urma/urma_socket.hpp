@@ -158,15 +158,8 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfc succeeded: jfc_id="
               << jfc_->jfc_id.id << ", depth=" << jfc_cfg.depth;
 
-	    uint32_t rqe_multiple = 1;
-	    auto dev_name = device_->name();
-	    if (dev_name.compare(0, 7, "bonding") == 0) {
-	      rqe_multiple = 8;
-	    }
-
-	    urma_jfr_cfg_t jfr_cfg{};
-    jfr_cfg.depth = static_cast<uint32_t>(
-        (recv_buffer_cnt_ + 1) * rqe_multiple);
+    urma_jfr_cfg_t jfr_cfg{};
+    jfr_cfg.depth = static_cast<uint32_t>(recv_buffer_cnt_ + 1);
     jfr_cfg.trans_mode = URMA_TM_RM;
     jfr_cfg.max_sge = 1;
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;

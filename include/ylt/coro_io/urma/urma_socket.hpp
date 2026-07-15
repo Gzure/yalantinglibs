@@ -386,15 +386,16 @@ struct urma_socket_shared_state_t
         auto ec = cr.status == URMA_CR_SUCCESS
                       ? std::error_code{}
                       : std::make_error_code(std::errc::io_error);
+        ELOG_INFO << "URMA CR: status=" << static_cast<int>(cr.status)
+                  << ", dir=" << (cr.flag.bs.s_r ? "recv" : "send")
+                  << ", opcode=" << static_cast<int>(cr.opcode)
+                  << ", len=" << cr.completion_len
+                  << ", user_ctx=" << cr.user_ctx
+                  << ", local_id=" << cr.local_id
+                  << ", remote_id=" << cr.remote_id.id
+                  << ", jetty=" << static_cast<int>(cr.flag.bs.jetty)
+                  << ", imm=" << static_cast<int>(cr.flag.bs.imm);
         if (ec) {
-          ELOG_ERROR << "URMA completion failed: status="
-                     << static_cast<int>(cr.status)
-                     << ", direction=" << (cr.flag.bs.s_r ? "recv" : "send")
-                     << ", opcode=" << static_cast<int>(cr.opcode)
-                     << ", completion_len=" << cr.completion_len
-                     << ", user_ctx=" << cr.user_ctx
-                     << ", local_id=" << cr.local_id;
-        }
         if (cr.flag.bs.s_r == 0) {
           if (send_callbacks_.empty()) continue;
           auto pending = send_callbacks_.pop();

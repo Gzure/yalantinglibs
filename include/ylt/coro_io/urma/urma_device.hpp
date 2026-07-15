@@ -27,6 +27,7 @@
 
 #ifdef YLT_ENABLE_URMA
 #include "ylt/urma/urma_api.h"
+#include "ylt/urma/urma_ubagg.h"
 #endif
 
 namespace coro_io {
@@ -234,6 +235,18 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name, int eid_
   }
 
   urma_free_device_list(devices);
+
+  if (name_.compare(0, 7, "bonding") == 0) {
+    bondp_set_bonding_mode_in_t mode_in{};
+    mode_in.bonding_mode = BONDP_BONDING_MODE_BALANCE;
+    mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
+    urma_user_ctl_in_t uin{};
+    uin.addr = reinterpret_cast<uint64_t>(&mode_in);
+    uin.len = sizeof(mode_in);
+    uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
+    urma_user_ctl_out_t uout{};
+    urma_user_ctl(context_, &uin, &uout);
+  }
 
   auto default_pool_config = urma_buffer_pool_config_t{};
   if (!configure_buffer_pool(default_pool_config.buffer_size,

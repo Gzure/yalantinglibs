@@ -286,7 +286,7 @@ struct urma_socket_shared_state_t
     wr.opcode = URMA_OPC_SEND;
     wr.flag.bs.complete_enable = 1;
     wr.tjetty = remote_jetty_.get();
-    wr.user_ctx = 1;
+    wr.user_ctx = 0;
     wr.send = send_wr;
     urma_jfs_wr_t* bad_wr = nullptr;
     auto ec =
@@ -353,7 +353,7 @@ struct urma_socket_shared_state_t
             wr.opcode = URMA_OPC_SEND;
             wr.flag.bs.complete_enable = 1;
             wr.tjetty = remote_jetty_.get();
-            wr.user_ctx = 1;
+            wr.user_ctx = 0;
             wr.send.src.sge = &sge;
             wr.send.src.num_sge = 1;
             urma_jfs_wr_t* bad_wr = nullptr;

@@ -169,9 +169,55 @@ struct urma_socket_shared_state_t
     ELOG_INFO << "urma_create_jfc succeeded: jfc_id="
               << jfc_->jfc_id.id << ", depth=" << jfc_cfg.depth;
 
+    // Query bonding active port count BEFORE creating the JFR, using a
+    // temporary minimal JFR.  This avoids deleting and recreating the real
+    // JFR, which can cause resource issues when client and server share the
+    // same bonding context.  Matching perftest's get_rqe_prefill_multiple.
+    uint32_t rqe_multiple = 1;
+    auto dev_name = device_->name();
+    if (dev_name.compare(0, 7, "bonding") == 0) {
+      urma_jfr_cfg_t query_cfg{};
+      query_cfg.depth = 1;
+      query_cfg.trans_mode = URMA_TM_RM;
+      query_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
+      query_cfg.jfc = jfc_.get();
+      urma_jfr_t* query_jfr =
+          urma_create_jfr(device_->context(), &query_cfg);
+      if (query_jfr) {
+        bondp_query_port_in_t qin{};
+        qin.jfr = query_jfr;
+        bondp_query_port_out_t qout{};
+        urma_user_ctl_in_t uin{};
+        uin.addr = reinterpret_cast<uint64_t>(&qin);
+        uin.len = sizeof(qin);
+        uin.opcode = BONDP_USER_CTL_QUERY_PORT;
+        urma_user_ctl_out_t uout{};
+        uout.addr = reinterpret_cast<uint64_t>(&qout);
+        uout.len = sizeof(qout);
+        if (urma_user_ctl(device_->context(), &uin, &uout) == URMA_SUCCESS &&
+            qout.active_count > 1) {
+          rqe_multiple = qout.active_count;
+          ELOG_INFO << "Bonding device active port count=" << rqe_multiple
+                    << ", JFR depth=" << (recv_buffer_cnt_ + 1) << " * "
+                    << rqe_multiple << " = "
+                    << ((recv_buffer_cnt_ + 1) * rqe_multiple);
+        } else if (qout.active_count == 0) {
+          ELOG_WARN << "Bonding device query returned active_count=0, using "
+                       "rqe_multiple=1";
+        }
+        urma_delete_jfr(query_jfr);
+      } else {
+        ELOG_WARN << "Failed to create query JFR for bonding port count, "
+                     "using rqe_multiple=1";
+      }
+    }
+
     // Create JFR matching perftest fill_jfr_cfg (perftest_resources.c:538-555).
+    // Depth is multiplied by rqe_multiple for bonding devices so the virtual
+    // JFR can hold enough recv WRs for all active ports.
     urma_jfr_cfg_t jfr_cfg{};
-    jfr_cfg.depth = static_cast<uint32_t>(recv_buffer_cnt_ + 1);
+    jfr_cfg.depth = static_cast<uint32_t>(
+        (recv_buffer_cnt_ + 1) * rqe_multiple);
     jfr_cfg.trans_mode = URMA_TM_RM;
     jfr_cfg.max_sge = 1;
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
@@ -191,53 +237,6 @@ struct urma_socket_shared_state_t
     }
     ELOG_INFO << "urma_create_jfr succeeded: jfr_id="
               << jfr_->jfr_id.id << ", depth=" << jfr_cfg.depth;
-
-    // Query bonding active port count and adjust JFR depth, matching
-    // perftest's get_rqe_prefill_multiple_simplex (perftest_run_test.c:146-172).
-    // The virtual JFR depth must accommodate all active ports; otherwise
-    // urma_post_jetty_recv_wr returns ENOMEM when the virtual WR buffer fills.
-    uint32_t rqe_multiple = 1;
-    auto dev_name = device_->name();
-    if (dev_name.compare(0, 7, "bonding") == 0) {
-      bondp_query_port_in_t qin{};
-      qin.jfr = jfr_.get();
-      bondp_query_port_out_t qout{};
-      urma_user_ctl_in_t uin{};
-      uin.addr = reinterpret_cast<uint64_t>(&qin);
-      uin.len = sizeof(qin);
-      uin.opcode = BONDP_USER_CTL_QUERY_PORT;
-      urma_user_ctl_out_t uout{};
-      uout.addr = reinterpret_cast<uint64_t>(&qout);
-      uout.len = sizeof(qout);
-      if (urma_user_ctl(device_->context(), &uin, &uout) == URMA_SUCCESS &&
-          qout.active_count > 1) {
-        rqe_multiple = qout.active_count;
-        ELOG_INFO << "Bonding device active port count=" << rqe_multiple
-                  << ", recreating JFR with depth="
-                  << (recv_buffer_cnt_ + 1) << " * " << rqe_multiple << " = "
-                  << ((recv_buffer_cnt_ + 1) * rqe_multiple);
-        // Delete and recreate JFR with multiplied depth so the virtual JFR
-        // can hold enough recv WRs for all active ports.
-        jfr_.reset();
-        jfr_cfg.depth = static_cast<uint32_t>(
-            (recv_buffer_cnt_ + 1) * rqe_multiple);
-        errno = 0;
-        jfr_.reset(urma_create_jfr(device_->context(), &jfr_cfg));
-        if (!jfr_) {
-          set_init_error("urma_create_jfr(bonding)", errno);
-          ELOG_ERROR << "urma_create_jfr(bonding) failed: depth="
-                     << jfr_cfg.depth
-                     << ", errno=" << init_error_.value()
-                     << ", error=" << init_error_.message();
-          return false;
-        }
-        ELOG_INFO << "urma_create_jfr(bonding) succeeded: jfr_id="
-                  << jfr_->jfr_id.id << ", depth=" << jfr_cfg.depth;
-      } else if (qout.active_count == 0) {
-        ELOG_WARN << "Bonding device query returned active_count=0, using "
-                     "rqe_multiple=1";
-      }
-    }
 
     // Jetty creation matching perftest create_jetty with share_jfr=true
     // (perftest_resources.c:616-629).  JFS config mirrors fill_jfs_cfg

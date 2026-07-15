@@ -182,6 +182,24 @@ struct urma_socket_shared_state_t
                 << ", aggr_mode=" << static_cast<int>(ctx->aggr_mode)
                 << " (0=standalone, 1=active_backup, 2=balance)"
                 << ", hw_port_cnt=" << static_cast<int>(dev_attr.port_cnt);
+
+      // Set bonding mode matching perftest init_device (perftest_resources.c:237).
+      // Even when values match defaults this ensures the bonding driver's
+      // internal topology state is consistent with hardware.
+      bondp_set_bonding_mode_in_t mode_in{};
+      mode_in.bonding_mode = static_cast<bondp_bonding_mode_t>(ctx->aggr_mode);
+      mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
+      urma_user_ctl_in_t mode_uin{};
+      mode_uin.addr = reinterpret_cast<uint64_t>(&mode_in);
+      mode_uin.len = sizeof(mode_in);
+      mode_uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
+      urma_user_ctl_out_t mode_uout{};
+      auto mode_ret = urma_user_ctl(ctx, &mode_uin, &mode_uout);
+      ELOG_INFO << "BONDP_USER_CTL_SET_BONDING_MODE: mode="
+                << static_cast<int>(mode_in.bonding_mode)
+                << ", level=" << static_cast<int>(mode_in.bonding_level)
+                << ", ret=" << static_cast<int>(mode_ret);
+
       urma_jfr_cfg_t query_cfg{};
       query_cfg.depth = 2;  // depth=1 may fail on bonding
       query_cfg.trans_mode = URMA_TM_RM;

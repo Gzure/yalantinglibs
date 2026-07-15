@@ -641,6 +641,7 @@ class urma_socket_t {
     if (write_ec) co_return write_ec;
     record_handshake_endpoints();
     close_handshake_socket();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
     for (int i = 0; i < 5; i++) state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};
@@ -952,6 +953,7 @@ class urma_socket_t {
     if (ec) co_return ec;
     record_handshake_endpoints();
     close_handshake_socket();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
     for (int i = 0; i < 5; i++) state_->poll_once();
     state_->start_polling();
     co_return std::error_code{};

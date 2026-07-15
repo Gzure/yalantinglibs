@@ -27,6 +27,7 @@
 
 #ifdef YLT_ENABLE_URMA
 #include "ylt/urma/urma_api.h"
+#include "ylt/urma/urma_ubagg.h"
 #endif
 
 namespace coro_io {
@@ -234,6 +235,28 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name, int eid_
   }
 
   urma_free_device_list(devices);
+
+  // Set bonding mode to BALANCE before creating any resources, matching
+  // perftest init_device.  Standalone mode posts all recv WRs to a single
+  // physical port, but CTP hardware sprays packets across all ports, causing
+  // RNR (status=10) on ports without pre-posted recv WRs.  Balance mode
+  // distributes recv WRs across active ports, covering all CTP spray targets.
+  // Must be called before configure_buffer_pool (which registers memory and
+  // increments ctx->ref.atomic_cnt, causing URMA_EAGAIN).
+  if (name_.compare(0, 7, "bonding") == 0) {
+    bondp_set_bonding_mode_in_t mode_in{};
+    mode_in.bonding_mode = BONDP_BONDING_MODE_BALANCE;
+    mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
+    urma_user_ctl_in_t uin{};
+    uin.addr = reinterpret_cast<uint64_t>(&mode_in);
+    uin.len = sizeof(mode_in);
+    uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
+    urma_user_ctl_out_t uout{};
+    auto ret = urma_user_ctl(context_, &uin, &uout);
+    ELOG_INFO << "BONDP_USER_CTL_SET_BONDING_MODE(balance, iodie): ret="
+              << static_cast<int>(ret);
+  }
+
   auto default_pool_config = urma_buffer_pool_config_t{};
   if (!configure_buffer_pool(default_pool_config.buffer_size,
                              default_pool_config.max_memory_usage)) {

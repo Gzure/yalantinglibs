@@ -238,7 +238,7 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name, int eid_
 
   if (name_.compare(0, 7, "bonding") == 0) {
     bondp_set_bonding_mode_in_t mode_in{};
-    mode_in.bonding_mode = BONDP_BONDING_MODE_BALANCE;
+    mode_in.bonding_mode = BONDP_BONDING_MODE_ACTIVE_BACKUP;
     mode_in.bonding_level = BONDP_BONDING_LEVEL_IODIE;
     urma_user_ctl_in_t uin{};
     uin.addr = reinterpret_cast<uint64_t>(&mode_in);
@@ -246,7 +246,7 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name, int eid_
     uin.opcode = BONDP_USER_CTL_SET_BONDING_MODE;
     urma_user_ctl_out_t uout{};
     auto ret = urma_user_ctl(context_, &uin, &uout);
-    ELOG_INFO << "BONDP_USER_CTL_SET_BONDING_MODE(balance, iodie): ret="
+    ELOG_INFO << "BONDP_USER_CTL_SET_BONDING_MODE(active_backup, iodie): ret="
               << static_cast<int>(ret);
   }
 

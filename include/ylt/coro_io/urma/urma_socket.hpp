@@ -98,6 +98,7 @@ struct urma_socket_shared_state_t
     urma_buffer_t buffer;
     std::size_t length;
     callback_t callback;
+    int rnr_retries = 0;
   };
 
   struct pending_recv {
@@ -341,6 +342,25 @@ struct urma_socket_shared_state_t
         if (cr.flag.bs.s_r == 0) {
           if (send_callbacks_.empty()) continue;
           auto pending = send_callbacks_.pop();
+          if (ec && cr.status == 10 && pending.rnr_retries < 3) {
+            pending.rnr_retries++;
+            ELOG_WARN << "URMA send RNR, retry " << pending.rnr_retries;
+            urma_sge_t sge{reinterpret_cast<uint64_t>(pending.buffer.addr),
+                           static_cast<uint32_t>(pending.length),
+                           static_cast<urma_target_seg_t*>(pending.buffer.seg),
+                           nullptr};
+            urma_jfs_wr_t wr{};
+            wr.opcode = URMA_OPC_SEND;
+            wr.flag.bs.complete_enable = 1;
+            wr.tjetty = remote_jetty_.get();
+            wr.user_ctx = 1;
+            wr.send.src.sge = &sge;
+            wr.send.src.num_sge = 1;
+            urma_jfs_wr_t* bad_wr = nullptr;
+            urma_post_jetty_send_wr(jetty_.get(), &wr, &bad_wr);
+            send_callbacks_.push(std::move(pending));
+            continue;
+          }
           if (pending.buffer)
             device_->get_buffer_pool()->return_buffer(pending.buffer);
           resume({ec, pending.length}, std::move(pending.callback));

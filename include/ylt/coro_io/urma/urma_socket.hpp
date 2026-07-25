@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -510,6 +511,31 @@ struct urma_socket_shared_state_t
     }
   }
 
+  // Called from the poll thread when a CQE indicates a transport error
+  // (cr.status != URMA_CR_SUCCESS) or when the group is being torn down for a
+  // hardware/jfc-level failure.  The jetty is in an error state: subsequent
+  // WRs will also fail or hang, so every pending coroutine on this socket must
+  // be woken with operation_canceled and the socket unregistered.
+  //
+  // close() runs fail_pending (which drains pending sends/recvs) and
+  // unregister_socket, but it touches asio objects (poll_timer_, socket_,
+  // event_fd_) and must NOT run on the poll thread - so it is posted onto the
+  // socket's own executor, mirroring finish_recv_handoff/poll_once.  close()
+  // is idempotent (it opens with `if (has_close_.exchange(true)) return;`),
+  // and fail_pending is safe to run on the executor while a poll-thread
+  // on_send/on_recv_completion is mid-flight: those bail on has_close_ at the
+  // top (on_recv) or on a pending_send miss (on_send), and the locks inside
+  // fail_pending serialize the container drains.
+  //
+  // The has_close_ pre-check here avoids posting a redundant close() for every
+  // erroring CQE in a burst (only the first post proceeds); the exchange inside
+  // close() is the authoritative idempotency guard.
+  void post_close_on_error() {
+    if (has_close_.load(std::memory_order_acquire)) return;  // already closing
+    auto self = shared_from_this();
+    asio::post(executor_->get_asio_executor(), [self] { self->close(); });
+  }
+
   std::pair<std::error_code, std::size_t> poll_completion() {
     std::array<urma_cr_t, 16> completions{};
     int count = 0;
@@ -982,6 +1008,97 @@ inline void urma_poll_thread_pool::dispatch(urma_jfc_group* group,
     s->on_send_completion(seq, ec, cr.completion_len);
   } else if (op == urma_ctx_op_recv) {
     s->on_recv_completion(ec, cr.completion_len);
+  }
+  // On a transport error (cr.status != URMA_CR_SUCCESS) the jetty is in an
+  // error state: every other in-flight WR on this socket will also fail or
+  // hang, so leaving the socket registered strands those coroutines.  Per
+  // spec §5 (error handling): mark the socket errored, wake ALL its pending
+  // coroutines with operation_canceled, and trigger close - other sockets in
+  // the group are unaffected (isolation).  post_close_on_error() posts close()
+  // onto the socket's executor (close() touches asio objects and must not run
+  // on the poll thread); close() -> fail_pending drains all pending send/recv
+  // and unregister_socket removes it from the group.  The has_close_ check
+  // inside post_close_on_error suppresses redundant posts for every erroring
+  // CQE in a burst.  The single matching op above was already handed its ec,
+  // so it completes with the transport error; the teardown wakes the rest.
+  if (ec) {
+    s->post_close_on_error();
+  }
+}
+
+// Out-of-line definition of urma_poll_thread_pool::poll_loop, declared in
+// urma_poll_thread_pool.hpp.  Defined here (after the full
+// urma_socket_shared_state_t definition) because the group-level error
+// escalation calls s->post_close_on_error() via group->for_each_socket(...),
+// which requires the complete socket type.  This mirrors the dispatch pattern.
+inline void urma_poll_thread_pool::poll_loop(uint32_t gi) {
+  auto* group = groups_[gi].get();
+  auto* jfc = group->jfc();
+  auto* jfce = group->jfce();
+  std::array<urma_cr_t, 16> crs{};
+  std::size_t idle_spins = 0;
+  int rearm_failures = 0;
+  // Consecutive urma_poll_jfc failures (< 0).  A single transient hiccup is
+  // not fatal; a sustained run indicates the jfc/jfce is broken (hardware
+  // failure), at which point the whole group is unusable and must be torn down
+  // per spec §5 (group-level error).
+  int consecutive_errors = 0;
+  while (!stop_.load(std::memory_order_acquire)) {
+    int n = urma_poll_jfc(jfc, static_cast<int>(crs.size()), crs.data());
+    if (n < 0) {
+      ELOG_WARN << "urma_poll_jfc error errno=" << errno << " group=" << gi;
+      if (++consecutive_errors >= 64) {
+        // Persistent poll failure -> the jfc/jfce is broken.  Mark the group
+        // errored (new sockets are rejected at init), wake every registered
+        // socket with a teardown (post close() onto each socket's executor,
+        // which drains its pending coroutines with operation_canceled and
+        // unregisters it), and exit this poll thread.  Other groups keep
+        // running (isolation).
+        ELOG_ERROR << "urma_poll_jfc persistently failing for group=" << gi
+                   << "; marking group errored and exiting poll thread";
+        group->mark_errored();
+        group->for_each_socket([](urma_socket_shared_state_t* s) {
+          s->post_close_on_error();
+        });
+        return;  // exit this poll thread
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    // Any successful poll (n >= 0, including the n == 0 idle case) clears the
+    // consecutive-error counter: the group has recovered from a transient
+    // hiccup, so do not accumulate stale failures toward the threshold.
+    consecutive_errors = 0;
+    if (n > 0) {
+      for (int k = 0; k < n; ++k) dispatch(group, crs[k]);
+      idle_spins = 0;
+      continue;
+    }
+    if (++idle_spins < cfg_.busy_poll_budget) continue;
+
+    // idle budget exceeded -> block on the event channel
+    if (urma_rearm_jfc(jfc, false) != URMA_SUCCESS) {
+      if (++rearm_failures > 8) {
+        ELOG_WARN << "urma_rearm_jfc failing repeatedly group=" << gi;
+        rearm_failures = 0;
+      }
+      idle_spins = 0;
+      continue;
+    }
+    rearm_failures = 0;
+    urma_jfc_t* ev_jfc = nullptr;
+    int ev = urma_wait_jfc(jfce, 1,
+                           static_cast<int>(cfg_.wait_timeout.count()),
+                           &ev_jfc);
+    if (ev > 0 && ev_jfc) {
+      uint32_t ack = 1;
+      urma_ack_jfc(&ev_jfc, &ack, 1);
+    } else if (ev == 0 && errno != 512 /* ERESTARTSYS */) {
+      ELOG_INFO << "urma_wait_jfc no event group=" << gi << " errno=" << errno;
+    } else if (ev < 0) {
+      ELOG_WARN << "urma_wait_jfc error group=" << gi;
+    }
+    idle_spins = 0;
   }
 }
 

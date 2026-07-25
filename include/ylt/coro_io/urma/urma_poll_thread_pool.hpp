@@ -98,52 +98,15 @@ class urma_poll_thread_pool {
 
   // Hybrid loop: busy-poll the group's jfc; after busy_poll_budget empty
   // polls, rearm + wait_jfc (bounded timeout).  On wakeup, resume busy-poll.
-  void poll_loop(uint32_t gi) {
-    auto* group = groups_[gi].get();
-    auto* jfc = group->jfc();
-    auto* jfce = group->jfce();
-    std::array<urma_cr_t, 16> crs{};
-    std::size_t idle_spins = 0;
-    int rearm_failures = 0;
-    while (!stop_.load(std::memory_order_acquire)) {
-      int n = urma_poll_jfc(jfc, static_cast<int>(crs.size()), crs.data());
-      if (n < 0) {
-        ELOG_WARN << "urma_poll_jfc error errno=" << errno << " group=" << gi;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        continue;
-      }
-      if (n > 0) {
-        for (int k = 0; k < n; ++k) dispatch(group, crs[k]);
-        idle_spins = 0;
-        continue;
-      }
-      if (++idle_spins < cfg_.busy_poll_budget) continue;
-
-      // idle budget exceeded -> block on the event channel
-      if (urma_rearm_jfc(jfc, false) != URMA_SUCCESS) {
-        if (++rearm_failures > 8) {
-          ELOG_WARN << "urma_rearm_jfc failing repeatedly group=" << gi;
-          rearm_failures = 0;
-        }
-        idle_spins = 0;
-        continue;
-      }
-      rearm_failures = 0;
-      urma_jfc_t* ev_jfc = nullptr;
-      int ev = urma_wait_jfc(jfce, 1,
-                             static_cast<int>(cfg_.wait_timeout.count()),
-                             &ev_jfc);
-      if (ev > 0 && ev_jfc) {
-        uint32_t ack = 1;
-        urma_ack_jfc(&ev_jfc, &ack, 1);
-      } else if (ev == 0 && errno != 512 /* ERESTARTSYS */) {
-        ELOG_INFO << "urma_wait_jfc no event group=" << gi << " errno=" << errno;
-      } else if (ev < 0) {
-        ELOG_WARN << "urma_wait_jfc error group=" << gi;
-      }
-      idle_spins = 0;
-    }
-  }
+  // Escalates a *persistent* urma_poll_jfc failure (>= 64 consecutive errors)
+  // to a group-level teardown: mark the group errored, wake every registered
+  // socket via post_close_on_error(), and exit the poll thread (spec §5).
+  //
+  // Declared here, defined out-of-line in urma_socket.hpp (alongside dispatch)
+  // because the group-level escalation calls s->post_close_on_error() through
+  // group->for_each_socket(...), which needs the complete
+  // urma_socket_shared_state_t type that is only visible in urma_socket.hpp.
+  void poll_loop(uint32_t gi);
 
   // Decode user_ctx and hand the completion to the owning socket.  Defined
   // out-of-line in urma_socket.hpp (which has the full socket definition) to

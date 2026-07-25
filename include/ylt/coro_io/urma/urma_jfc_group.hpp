@@ -95,6 +95,20 @@ class urma_jfc_group {
     return it == sockets_.end() ? nullptr : it->second;
   }
 
+  // Visit every registered socket (e.g. to wake them on a group-level error).
+  // The callback is invoked under the registry read lock.  Callers must not
+  // register/unregister from within the callback (that would deadlock against
+  // the shared lock held here).  The callback receives a raw, non-owning
+  // pointer; the socket is guaranteed to remain registered for the duration of
+  // the call, but its lifetime is owned by its shared_ptr elsewhere.
+  template <typename F>
+  void for_each_socket(F&& f) const {
+    std::shared_lock lk(registry_mtx_);
+    for (auto& [id, s] : sockets_) {
+      f(s);
+    }
+  }
+
   void mark_errored() { errored_.store(true, std::memory_order_release); }
   bool errored() const { return errored_.load(std::memory_order_acquire); }
 

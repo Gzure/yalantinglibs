@@ -67,6 +67,48 @@ TEST_CASE("urma handoff single-thread happy path") {
   CHECK(h.try_finish());
   CHECK(h.load_state() == completion_handoff::state::IDLE);
 }
+
+TEST_CASE("urma handoff branch A: READY before coroutine suspends") {
+  completion_handoff h;
+  // poll thread delivers first, while still IDLE -> goes to queue (no waiter)
+  h.try_deliver({});  // state IDLE, not WAITING -> returns false
+  CHECK(h.load_state() == completion_handoff::state::IDLE);
+  CHECK_FALSE(h.queue_empty());
+
+  // Now simulate: poll thread had already flipped to READY via a real
+  // WAITING->READY before the coroutine checked.  Drive that path directly:
+  completion_handoff h2;
+  CHECK(h2.try_begin_wait());          // IDLE -> WAITING
+  CHECK(h2.try_deliver({}));            // WAITING -> READY
+  CHECK(h2.load_state() == completion_handoff::state::READY);
+  // coroutine sees READY -> does NOT begin wait, takes pending directly
+  CHECK_FALSE(h2.try_begin_wait());     // cannot leave READY
+  auto cr = h2.take_pending();
+  CHECK(cr.has_value());
+  CHECK(h2.try_finish());               // READY -> IDLE
+}
+
+TEST_CASE("urma handoff fallback queue drains on wake") {
+  completion_handoff h;
+  CHECK(h.try_begin_wait());            // IDLE -> WAITING
+  // A second completion arrives while WAITING (the slot is occupied by the
+  // first): try_deliver succeeds for the first; the second must go to queue.
+  CHECK(h.try_deliver({0x11, 0, 0, 0}));   // first -> READY, pending set
+  // second delivery: state is READY, not WAITING -> false, enqueue
+  CHECK_FALSE(h.try_deliver({0x22, 0, 0, 0}));
+  h.push_queue({0x22, 0, 0, 0});
+  CHECK_FALSE(h.queue_empty());
+
+  // coroutine wakes, takes pending + drains queue
+  auto first = h.take_pending();
+  CHECK(first.has_value());
+  CHECK(first->user_ctx == 0x11);
+  auto second = h.pop_queue();
+  CHECK(second.has_value());
+  CHECK(second->user_ctx == 0x22);
+  CHECK(h.try_finish());
+  CHECK(h.load_state() == completion_handoff::state::IDLE);
+}
 #else
 TEST_CASE("urma handoff tests compile without urma support") {
   CHECK(true);

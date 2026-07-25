@@ -43,6 +43,7 @@
 #include "ylt/coro_io/data_view.hpp"
 #include "ylt/coro_io/detail/circle_buffer.hpp"
 #include "ylt/coro_io/urma/urma_buffer.hpp"
+#include "ylt/coro_io/urma/urma_deleter.hpp"
 #include "ylt/coro_io/urma/urma_device.hpp"
 #include "ylt/easylog.hpp"
 #include "ylt/struct_pack.hpp"
@@ -71,27 +72,6 @@ inline std::error_code make_urma_error(int status) {
   if (status == URMA_SUCCESS) return {};
   return std::error_code(std::abs(status), std::generic_category());
 }
-
-struct urma_deleter {
-  void operator()(urma_jfc_t* value) const {
-    if (value) urma_delete_jfc(value);
-  }
-  void operator()(urma_jfr_t* value) const {
-    if (value) urma_delete_jfr(value);
-  }
-  void operator()(urma_jetty_t* value) const {
-    if (value) urma_delete_jetty(value);
-  }
-  void operator()(urma_jfce_t* value) const {
-    if (value) urma_delete_jfce(value);
-  }
-  void operator()(urma_target_jetty_t* value) const {
-    if (value) urma_unimport_jetty(value);
-  }
-  void operator()(urma_target_seg_t* value) const {
-    if (value) urma_unimport_seg(value);
-  }
-};
 
 struct urma_socket_shared_state_t
     : std::enable_shared_from_this<urma_socket_shared_state_t> {

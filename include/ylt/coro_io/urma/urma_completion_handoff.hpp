@@ -44,9 +44,16 @@ struct handoff_cr {
 //   READY   - a completion has been handed off; the coroutine must take it.
 //
 // Coroutine (request thread):
-//   if try_begin_wait():           // IDLE -> WAITING
-//       store resume handle, suspend
+//   if try_begin_wait(fn, ctx):    // store handle, THEN IDLE -> WAITING
+//       suspend                    // handle already published, no lost wakeup
+//   else:                          // already READY (branch A): poll thread won
+//       take_pending(); try_finish();   // READY -> IDLE
 //   on wake: take_pending(); try_finish();   // READY -> IDLE
+//
+// NOTE: the resume handle MUST be stored BEFORE publishing WAITING. Use the
+// two-arg try_begin_wait(fn, ctx) for the production suspend path; the zero-arg
+// try_begin_wait() + set_resume_handle() sequence publishes WAITING first and
+// has a lost-wakeup window, so it is for tests only.
 //
 // Poll thread:
 //   if try_deliver(cr):            // WAITING -> READY (direct handoff)
@@ -63,17 +70,46 @@ class completion_handoff {
     return state(st_.load(std::memory_order_acquire));
   }
 
-  // Coroutine side: attempt to enter WAITING. Returns false if the state is
-  // already READY (poll thread delivered before the coroutine suspended); in
-  // that case the coroutine should take_pending() immediately.
+  // Coroutine side: attempt to enter WAITING without registering a resume
+  // handle. For tests / when no resume callback is needed. PRODUCTION suspend
+  // path MUST use the two-arg overload below (handle published BEFORE state) to
+  // avoid a lost wakeup: the poll thread, on observing WAITING via its
+  // try_deliver CAS, would call take_resume_handle() and get nullptr if the
+  // handle has not been stored yet.
   bool try_begin_wait() noexcept {
     uint32_t expected = uint32_t(state::IDLE);
     return st_.compare_exchange_strong(expected, uint32_t(state::WAITING),
                                        std::memory_order_acq_rel);
   }
 
-  // Coroutine side: publish the resume handle just before suspending. The
-  // poll thread reads it via take_resume_handle() on the WAITING->READY flip.
+  // Coroutine side: store the resume handle, THEN attempt IDLE -> WAITING.
+  // Publishing the handle before the state guarantees the poll thread, on
+  // observing WAITING, can read a valid handle (no lost wakeup). Returns
+  // false if the state is already READY (branch A: poll thread delivered
+  // before the coroutine suspended); the coroutine should take_pending()
+  // immediately without suspending.
+  //
+  // Memory ordering: the handle stores are sequenced-before the CAS, so the
+  // CAS's release (on success) publishes both the WAITING state AND the handle
+  // stores to any thread that acquires the state. A poll thread that succeeds
+  // at its acquire CAS (WAITING->READY) therefore sees the handle stores. The
+  // handle stores themselves are relaxed because they are only read through the
+  // state-published synchronization; they need no independent ordering.
+  bool try_begin_wait(resume_fn fn, void* ctx) noexcept {
+    resume_ctx_.store(ctx, std::memory_order_relaxed);
+    resume_fn_.store(fn, std::memory_order_relaxed);
+    uint32_t expected = uint32_t(state::IDLE);
+    return st_.compare_exchange_strong(expected, uint32_t(state::WAITING),
+                                       std::memory_order_acq_rel);
+  }
+
+  // Coroutine side: publish the resume handle into an already-WAITING slot.
+  // LEGACY / secondary path. The preferred production path is the two-arg
+  // try_begin_wait(fn, ctx), which stores the handle BEFORE publishing WAITING
+  // and therefore cannot lose a wakeup. Calling set_resume_handle AFTER a
+  // successful zero-arg try_begin_wait() reintroduces the lost-wakeup window
+  // (poll thread may observe WAITING before the handle is stored) and must NOT
+  // be used in the production suspend path.
   void set_resume_handle(resume_fn fn, void* ctx) noexcept {
     resume_ctx_.store(ctx, std::memory_order_release);
     resume_fn_.store(fn, std::memory_order_release);
@@ -101,8 +137,12 @@ class completion_handoff {
     return true;
   }
 
-  // Coroutine side: take the directly-handed-off completion (valid when state
-  // is READY). Does not change state.
+  // Coroutine side: take the directly-handed-off completion.  CONTRACT: the
+  // caller must have observed state == READY via an acquire load (a failed
+  // try_begin_wait CAS, or load_state() == READY) before calling this; that
+  // acquire synchronizes with the poll thread's release CAS that sequenced
+  // before pending_cr_ was emplaced, making the emplace visible here. Does
+  // not change state.
   std::optional<handoff_cr> take_pending() noexcept {
     return pending_cr_;
   }

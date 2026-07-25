@@ -45,6 +45,28 @@ TEST_CASE("urma ctx encode/decode boundary values") {
 TEST_CASE("urma ctx op occupies top 8 bits") {
   CHECK((encode_ctx(0x2, 0, 0) >> 56) == 0x2);
 }
+
+#include <ylt/coro_io/urma/urma_completion_handoff.hpp>
+
+TEST_CASE("urma handoff single-thread happy path") {
+  completion_handoff h;
+  CHECK(h.load_state() == completion_handoff::state::IDLE);
+
+  // coroutine suspends: IDLE -> WAITING, registers a handle slot
+  CHECK(h.try_begin_wait());
+  CHECK(h.load_state() == completion_handoff::state::WAITING);
+
+  // poll thread delivers a completion while WAITING -> direct handoff to READY
+  bool resumed = h.try_deliver({});  // empty cr placeholder
+  CHECK(resumed);
+  CHECK(h.load_state() == completion_handoff::state::READY);
+
+  // coroutine wakes, takes the pending completion, returns to IDLE
+  auto cr = h.take_pending();
+  CHECK(cr.has_value());
+  CHECK(h.try_finish());
+  CHECK(h.load_state() == completion_handoff::state::IDLE);
+}
 #else
 TEST_CASE("urma handoff tests compile without urma support") {
   CHECK(true);

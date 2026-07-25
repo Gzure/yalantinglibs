@@ -332,25 +332,19 @@ struct urma_socket_shared_state_t
 
   void async_receive(callback_t&& callback) {
     if (thread_pool_mode_) {
-      // Thread-pool recv path (Defect 1): recv_result_ holds overflow
-      // completions that arrived while the single slot was already occupied by
-      // an unconsumed result, so it MUST be drained FIRST.  Order under the
-      // lock:
-      //   1. recv_result_ non-empty -> pop and complete inline (drain overflow).
-      //   2. recv_pending_cr_ set   -> take the slot inline.
+      // Thread-pool recv path.  Take the OLDEST unconsumed result first to
+      // preserve FIFO byte-stream order.  on_recv_completion fills the single
+      // slot (recv_pending_cr_) when it is free, and only overflows into
+      // recv_result_ when the slot is already occupied by an unconsumed result,
+      // so the slot always holds the oldest result and recv_result_ holds later
+      // ones in FIFO order.  Drain order under the lock:
+      //   1. recv_pending_cr_ set   -> take the slot inline (oldest).
+      //   2. recv_result_ non-empty -> pop and complete inline (later overflow).
       //   3. otherwise              -> store recv_pending_callback_ (waiter).
       // unique_lock so we can unlock before invoking the callback.
       std::unique_lock lk(recv_handoff_mtx_);
-      if (!recv_result_.empty()) {
-        auto pending = recv_result_.pop();
-        bool have_buf = pending.buffer;
-        if (have_buf) recv_buffer_ = std::move(pending.buffer);
-        lk.unlock();
-        resume(std::move(pending.result), std::move(callback));
-        return;
-      }
       if (recv_pending_cr_) {
-        // Result arrived before the coroutine suspended: complete inline.
+        // Slot -> complete inline.
         auto cr = *recv_pending_cr_;
         recv_pending_cr_.reset();
         bool have_buf = recv_pending_buffer_valid_;
@@ -361,6 +355,15 @@ struct urma_socket_shared_state_t
             ? std::make_error_code(std::errc::io_error)
             : std::error_code{};
         resume({ec, cr.completion_len}, std::move(callback));
+        return;
+      }
+      if (!recv_result_.empty()) {
+        // Overflow -> complete inline.
+        auto pending = recv_result_.pop();
+        bool have_buf = pending.buffer;
+        if (have_buf) recv_buffer_ = std::move(pending.buffer);
+        lk.unlock();
+        resume(std::move(pending.result), std::move(callback));
         return;
       }
       // Nothing ready: register as the waiter.  The poll thread's

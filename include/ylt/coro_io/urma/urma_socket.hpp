@@ -30,6 +30,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "asio/dispatch.hpp"
 #include "asio/ip/address.hpp"
@@ -331,12 +332,23 @@ struct urma_socket_shared_state_t
 
   void async_receive(callback_t&& callback) {
     if (thread_pool_mode_) {
-      // Thread-pool recv path: mutex-guarded single slot (mirrors the send
-      // path).  Under the lock either take a result that arrived before the
-      // coroutine suspended (complete inline), or register as the waiter
-      // (the poll thread's on_recv_completion will post finish_recv_handoff).
+      // Thread-pool recv path (Defect 1): recv_result_ holds overflow
+      // completions that arrived while the single slot was already occupied by
+      // an unconsumed result, so it MUST be drained FIRST.  Order under the
+      // lock:
+      //   1. recv_result_ non-empty -> pop and complete inline (drain overflow).
+      //   2. recv_pending_cr_ set   -> take the slot inline.
+      //   3. otherwise              -> store recv_pending_callback_ (waiter).
       // unique_lock so we can unlock before invoking the callback.
       std::unique_lock lk(recv_handoff_mtx_);
+      if (!recv_result_.empty()) {
+        auto pending = recv_result_.pop();
+        bool have_buf = pending.buffer;
+        if (have_buf) recv_buffer_ = std::move(pending.buffer);
+        lk.unlock();
+        resume(std::move(pending.result), std::move(callback));
+        return;
+      }
       if (recv_pending_cr_) {
         // Result arrived before the coroutine suspended: complete inline.
         auto cr = *recv_pending_cr_;
@@ -420,12 +432,24 @@ struct urma_socket_shared_state_t
     resume({ec, completion_len}, std::move(ps.callback));
   }
 
-  // Called by the poll thread when a recv CQE arrives.  Fills the single recv
-  // slot under recv_handoff_mtx_ and, if a recv coroutine is already waiting,
-  // posts finish_recv_handoff to the request-thread executor.  The lock plus
-  // the inline-take path in async_receive covers both orderings (result before
-  // vs after the coroutine suspends) with no stranding window.
+  // Called by the poll thread when a recv CQE arrives.  Under recv_handoff_mtx_:
+  // pop the completed buffer from recv_queue_, refill, then either fill the
+  // single recv slot (if no unconsumed result is sitting there) or push the new
+  // result into the recv_result_ overflow circle_buffer (the burst path - mirrors
+  // the legacy poll_completion recv handling).  If a recv coroutine is already
+  // waiting (recv_pending_callback_ set) the result is posted to the request
+  // thread via finish_recv_handoff; otherwise the slot/overflow is left for the
+  // next async_receive to take inline.  This avoids both the lost-completion
+  // (overwriting recv_pending_cr_) and the leaked-buffer (overwriting
+  // recv_pending_buffer_) defects that the single-slot design had under a burst.
+  //
+  // Defect 3: bail at the very top if close has begun so the poll thread stops
+  // touching socket state once release_resources/close is underway.  A tiny
+  // window between this check and acquiring recv_handoff_mtx_ remains, but
+  // release_resources takes the same lock before draining the containers, so it
+  // cannot destroy them while we hold it.
   void on_recv_completion(std::error_code ec, std::size_t completion_len) {
+    if (has_close_.load(std::memory_order_acquire)) return;  // close in flight
     if (completion_len == 0) {
       peer_close_ = true;
       has_close_ = true;
@@ -436,17 +460,40 @@ struct urma_socket_shared_state_t
     {
       std::lock_guard lk(recv_handoff_mtx_);
       if (recv_queue_.empty()) {
-        // protocol error: deliver an error result (no buffer).
-        recv_pending_cr_ =
-            handoff_cr{0, uint32_t(std::errc::protocol_error), 0, 1};
-        recv_pending_buffer_valid_ = false;
+        // protocol error: deliver an error result (no buffer).  Only fill the
+        // slot if it is free; otherwise drop into overflow so a pending waiter
+        // still observes the error via finish_recv_handoff/async_receive.
+        if (!recv_pending_cr_) {
+          recv_pending_cr_ =
+              handoff_cr{0, uint32_t(std::errc::protocol_error), 0, 1};
+          recv_pending_buffer_valid_ = false;
+        } else if (!recv_result_.full()) {
+          recv_result_.push(
+              pending_recv{{std::make_error_code(std::errc::protocol_error), 0},
+                           {}});
+        }
       } else {
-        recv_pending_buffer_ = recv_queue_.pop();
-        recv_pending_buffer_valid_ = true;
-        recv_pending_cr_ = cr;
+        urma_buffer_t completed_buffer = recv_queue_.pop();
         auto refill_ec = fill_recv_queue();
         if (refill_ec) {
           ELOG_ERROR << "URMA refill recv queue failed: " << refill_ec.message();
+        }
+        if (!recv_pending_cr_) {
+          // Slot free: hand this result off directly.
+          recv_pending_buffer_ = std::move(completed_buffer);
+          recv_pending_buffer_valid_ = true;
+          recv_pending_cr_ = cr;
+        } else {
+          // Slot occupied by an unconsumed result (a previous completion that no
+          // coroutine has taken yet): overflow this one into recv_result_.
+          if (recv_result_.full()) {
+            ELOG_ERROR << "URMA recv result queue is full; cannot cache "
+                          "completed recv buffer";
+            device_->get_buffer_pool()->return_buffer(completed_buffer);
+          } else {
+            recv_result_.push(
+                pending_recv{{ec, completion_len}, std::move(completed_buffer)});
+          }
         }
       }
       // Note whether a recv coroutine is waiting; the callback is NOT moved
@@ -716,6 +763,66 @@ struct urma_socket_shared_state_t
   }
 
   void fail_pending(std::error_code ec) {
+    if (thread_pool_mode_) {
+      // --- thread-pool path (Defect 2): drain thread-pool pending state so no
+      // coroutine is stranded and no buffer leaks. ---
+      // Pending sends: move all entries out under the lock, clear the map, then
+      // return buffers + resume callbacks with {ec, 0} after unlocking (the
+      // callback may re-enter post_send and re-take send_handoff_mtx_).  This
+      // mirrors on_send_completion's move-out-under-lock / resume-after-unlock.
+      {
+        std::vector<pending_send> drained;
+        drained.reserve(pending_send_by_seq_.size());
+        {
+          std::lock_guard lk(send_handoff_mtx_);
+          for (auto& [seq, ps] : pending_send_by_seq_) {
+            drained.push_back(std::move(ps));
+          }
+          pending_send_by_seq_.clear();
+        }
+        for (auto& ps : drained) {
+          if (ps.buffer) device_->get_buffer_pool()->return_buffer(ps.buffer);
+          resume({ec, 0}, std::move(ps.callback));
+        }
+      }
+      wake_writer(ec);
+      // Pending recv: resume a waiting coroutine, drop the handed-off slot
+      // result (returning its buffer), and drain the recv_result_ overflow.
+      // recv_callback_ (legacy single slot) is unused in thread-pool mode but
+      // is resumed for safety.  unique_lock so we can unlock before resuming
+      // (resume may re-enter async_receive/post_send and re-take the lock).
+      {
+        std::unique_lock lk(recv_handoff_mtx_);
+        if (recv_pending_callback_) {
+          callback_t cb = std::move(recv_pending_callback_);
+          recv_pending_callback_ = nullptr;
+          lk.unlock();
+          resume({ec, 0}, std::move(cb));
+          lk.lock();
+        }
+        if (recv_pending_cr_) {
+          recv_pending_cr_.reset();
+          if (recv_pending_buffer_valid_) {
+            device_->get_buffer_pool()->return_buffer(recv_pending_buffer_);
+            recv_pending_buffer_ = {};
+          }
+          recv_pending_buffer_valid_ = false;
+        }
+        while (!recv_result_.empty()) {
+          auto pending = recv_result_.pop();
+          if (pending.buffer)
+            device_->get_buffer_pool()->return_buffer(pending.buffer);
+        }
+        if (recv_callback_) {
+          callback_t cb = std::move(recv_callback_);
+          lk.unlock();
+          resume({ec, 0}, std::move(cb));
+          lk.lock();
+        }
+      }
+      return;
+    }
+    // --- legacy path (unchanged) ---
     if (recv_callback_) resume({ec, 0}, std::move(recv_callback_));
     while (!send_callbacks_.empty()) {
       auto pending = send_callbacks_.pop();
@@ -740,9 +847,55 @@ struct urma_socket_shared_state_t
   void release_resources() {
     close();
     if (recv_buffer_) device_->get_buffer_pool()->return_buffer(recv_buffer_);
-    while (!recv_queue_.empty()) {
-      auto buffer = recv_queue_.pop();
-      device_->get_buffer_pool()->return_buffer(buffer);
+    // Drain recv_queue_/recv_result_ and any leftover thread-pool handoff
+    // state.  In thread-pool mode the shared poll thread may still be in
+    // on_recv_completion (it bails on has_close_ at the top, but a call that
+    // already passed that check could be holding recv_handoff_mtx_), so the
+    // drains MUST be under the handoff locks to avoid destroying the
+    // circle_buffers mid-access.  release_resources runs at teardown, after
+    // close() has set has_close_ and run fail_pending (which already drained
+    // callbacks under these locks), so the locks are uncontended here in the
+    // steady state - they exist to close the residual poll-thread window.
+    // The legacy path (poll_once/event_loop on this executor) is gone by the
+    // time the destructor runs, so its drain stays unlocked as before.
+    if (thread_pool_mode_) {
+      std::lock_guard sk(send_handoff_mtx_);
+      // pending_send_by_seq_ was already cleared by fail_pending; any entry
+      // here is a send whose CQE arrived after close set has_close_ but before
+      // on_send_completion's lookup (it returns early on a miss).  Return its
+      // buffer just in case.
+      for (auto& [seq, ps] : pending_send_by_seq_) {
+        if (ps.buffer) device_->get_buffer_pool()->return_buffer(ps.buffer);
+      }
+      pending_send_by_seq_.clear();
+
+      std::lock_guard rk(recv_handoff_mtx_);
+      while (!recv_queue_.empty()) {
+        auto buffer = recv_queue_.pop();
+        device_->get_buffer_pool()->return_buffer(buffer);
+      }
+      // fail_pending already drained recv_result_/recv_pending_*; defend against
+      // a CQE that arrived between fail_pending and here (it would have bailed
+      // on has_close_, but the lock makes this deterministic).
+      if (recv_pending_cr_) {
+        recv_pending_cr_.reset();
+        if (recv_pending_buffer_valid_) {
+          device_->get_buffer_pool()->return_buffer(recv_pending_buffer_);
+          recv_pending_buffer_ = {};
+        }
+        recv_pending_buffer_valid_ = false;
+      }
+      while (!recv_result_.empty()) {
+        auto pending = recv_result_.pop();
+        if (pending.buffer)
+          device_->get_buffer_pool()->return_buffer(pending.buffer);
+      }
+    }
+    else {
+      while (!recv_queue_.empty()) {
+        auto buffer = recv_queue_.pop();
+        device_->get_buffer_pool()->return_buffer(buffer);
+      }
     }
     // Release stream_descriptor before closing the jfce fd it wraps.
     event_fd_.reset();

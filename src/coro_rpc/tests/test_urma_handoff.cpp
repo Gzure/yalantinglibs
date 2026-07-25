@@ -9,6 +9,10 @@
  */
 #include "doctest.h"
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 #ifdef YLT_ENABLE_URMA
 #include <ylt/coro_io/urma/urma_ctx_codec.hpp>
 
@@ -114,6 +118,78 @@ TEST_CASE("urma handoff fallback queue drains on wake") {
   CHECK(second->user_ctx == 0x22);
   CHECK(h.try_finish());
   CHECK(h.load_state() == completion_handoff::state::IDLE);
+}
+
+TEST_CASE("urma handoff cross-thread stress: no loss, single resume") {
+  completion_handoff h;
+  constexpr int N = 2000;
+  std::atomic<int> delivered{0};
+  std::atomic<int> resumed{0};
+
+  // resume callback context: bumps the resumed counter
+  struct ctx_t {
+    std::atomic<int>* r;
+  };
+  ctx_t c{&resumed};
+
+  // "request thread" (coroutine side): repeatedly publish the resume handle
+  // THEN enter WAITING via the two-arg try_begin_wait (handle stored before the
+  // IDLE->WAITING CAS, so the poll thread can never observe WAITING without a
+  // valid handle - no lost wakeup).  On wake (state READY) take the pending
+  // completion, drain the queue, and return to IDLE.
+  std::thread req([&] {
+    for (int i = 0; i < N; ++i) {
+      if (h.try_begin_wait(
+              [](void* p) { static_cast<ctx_t*>(p)->r->fetch_add(1); }, &c)) {
+        // suspended: spin-wait until the poll thread flips us to READY.
+        while (h.load_state() != completion_handoff::state::READY) {
+          std::this_thread::yield();
+        }
+        (void)h.take_pending();
+        while (h.pop_queue()) {
+        }
+        while (!h.try_finish()) {
+        }
+      } else {
+        // branch A: state was already READY (poll thread delivered first).
+        // The failed CAS acquired the state, so take_pending is safe.
+        (void)h.take_pending();
+        while (h.pop_queue()) {
+        }
+        while (!h.try_finish()) {
+        }
+      }
+    }
+  });
+
+  // "poll thread" (deliver side): deliver N completions.  This loop models the
+  // common production case where the poll thread hands a completion directly to
+  // a waiting coroutine: it retries try_deliver until the coroutine is WAITING,
+  // then reads+invokes the resume handle.  It NEVER pushes to the fallback
+  // queue, so no completion can be stranded while the coroutine is WAITING
+  // (which would otherwise hang the coroutine's spin on READY).  Every delivery
+  // therefore fires exactly one resume.
+  std::thread poll([&] {
+    for (int i = 0; i < N; ++i) {
+      handoff_cr cr{uint64_t(i), 0, 0, 0};
+      while (true) {
+        if (h.try_deliver(cr)) {
+          auto [fn, p] = h.take_resume_handle();
+          if (fn) fn(p);
+          delivered.fetch_add(1);
+          break;
+        }
+        // Not WAITING yet (coroutine between iterations: IDLE/READY).  It will
+        // reach WAITING on its next iteration; yield and retry.
+        std::this_thread::yield();
+      }
+    }
+  });
+
+  req.join();
+  poll.join();
+  CHECK(delivered.load() == N);
+  CHECK(resumed.load() == N);
 }
 #else
 TEST_CASE("urma handoff tests compile without urma support") {

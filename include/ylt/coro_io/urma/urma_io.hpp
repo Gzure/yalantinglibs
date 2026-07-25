@@ -18,8 +18,10 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <queue>
+#include <thread>
 #include <vector>
 
 #include "async_simple/Promise.h"
@@ -40,16 +42,20 @@ void make_urma_buffers(std::vector<AsioBuffer>& result,
 }
 
 struct urma_write_completion_state {
+  std::mutex mtx;
   std::queue<std::pair<std::error_code, std::size_t>> completions;
   async_simple::util::move_only_function<void()> resume_handler;
 
+  // Called by the poll thread (via the post_send callback).
   void push(std::pair<std::error_code, std::size_t> result) {
-    completions.push(result);
-    if (resume_handler) {
-      auto h = std::move(resume_handler);
+    async_simple::util::move_only_function<void()> h;
+    {
+      std::lock_guard lk(mtx);
+      completions.push(result);
+      h = std::move(resume_handler);   // single resume: move-and-clear under lock
       resume_handler = nullptr;
-      h();
     }
+    if (h) h();                        // resume outside the lock (no reentrancy)
   }
 };
 
@@ -57,31 +63,60 @@ inline async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>>
 wait_urma_write_completion(
     const std::shared_ptr<urma_write_completion_state>& state,
     urma_socket_t& socket) {
-  // Busy-poll the CQ directly on the calling thread.  The CQE typically
-  // arrives within 1-10us, but under load it can take longer.  Spin up to
-  // 2000 iterations (~50-100us) to catch it without suspending, avoiding
-  // the 50-300us event_loop wakeup latency.  Only suspend if still not
-  // ready after the spin budget.
-  for (int i = 0; i < 2000 && state->completions.empty(); ++i) {
-    socket.poll_completion_once();
+  (void)socket;  // no socket interaction needed; the poll thread fills state
+  // Fast path: 32 short checks of state->completions.  Each check takes the
+  // mutex briefly; std::this_thread::yield() keeps the request thread from
+  // starving siblings under heavy load.  Covers the typical 1-10us CQE window.
+  // The request thread must NOT poll the shared jfc here: in thread-pool mode
+  // the poll thread owns the jfc, and concurrent urma_poll_jfc loses CQEs.
+  for (int i = 0; i < 32; ++i) {
+    bool ready;
+    {
+      std::lock_guard lk(state->mtx);
+      ready = !state->completions.empty();
+    }
+    if (ready) break;
+    std::this_thread::yield();
   }
-  if (!state->completions.empty()) {
-    auto result = state->completions.front();
-    state->completions.pop();
-    co_return result;
+  {
+    std::lock_guard lk(state->mtx);
+    if (!state->completions.empty()) {
+      auto result = state->completions.front();
+      state->completions.pop();
+      co_return result;
+    }
   }
-  // CQE not ready after spin - suspend until event_loop polls and calls push.
-  while (state->completions.empty()) {
+  // Slow path: publish a resume handler under the lock, then suspend.
+  // callback_awaitor<void>::await_suspend runs the setup lambda BEFORE the
+  // coroutine suspends, so re-check completions inside the setup and resume
+  // immediately if a result arrived in the window (closes the lost-wakeup gap).
+  // handler.resume() is a synchronous inline resume on the current thread, so
+  // the lock must be released BEFORE calling it: the resumed body re-acquires
+  // state->mtx (non-recursive), and resuming under the lock would self-deadlock.
+  while (true) {
     callback_awaitor<void> awaitor;
     co_await awaitor.await_resume([&state](auto handler) {
-      state->resume_handler = [handler]() mutable {
-        handler.resume();
-      };
+      bool ready;
+      {
+        std::lock_guard lk(state->mtx);
+        ready = !state->completions.empty();
+        if (!ready) {
+          state->resume_handler = [handler]() mutable { handler.resume(); };
+        }
+      }
+      if (ready) {
+        handler.resume();   // result already here: do not suspend
+      }
     });
+    // Resumed (immediately above, or later via push).  Re-check under the lock.
+    std::lock_guard lk(state->mtx);
+    if (!state->completions.empty()) {
+      auto result = state->completions.front();
+      state->completions.pop();
+      co_return result;
+    }
+    // Spurious resume with nothing ready: loop and re-suspend.
   }
-  auto result = state->completions.front();
-  state->completions.pop();
-  co_return result;
 }
 
 template <typename Buffer>

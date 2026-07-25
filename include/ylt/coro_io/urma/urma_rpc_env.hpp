@@ -137,6 +137,13 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
     urma_rpc_parse_env_integer("URMA_RPC_POLL_INTERVAL", interval_us);
     config.poll_interval = std::chrono::microseconds(interval_us);
   }
+  urma_rpc_parse_env_integer("URMA_RPC_POLL_THREADS", config.poll_threads);
+  urma_rpc_parse_env_integer("URMA_RPC_GROUP_CQ_SIZE", config.group_cq_size);
+  {
+    uint64_t timeout_ms = 100;
+    urma_rpc_parse_env_integer("URMA_RPC_POLL_WAIT_TIMEOUT_MS", timeout_ms);
+    config.poll_wait_timeout = std::chrono::milliseconds(timeout_ms);
+  }
 
   return config;
 }
@@ -166,7 +173,11 @@ probe_urma_rpc_config(coro_io::urma_socket_t::config_t config) {
               << ", buffer_size=" << config.buffer_size
               << ", max_memory_usage=" << config.max_memory_usage
               << ", event_mode=" << (config.event_mode ? "on" : "off")
-              << ", busy_poll_budget=" << config.busy_poll_budget;
+              << ", busy_poll_budget=" << config.busy_poll_budget
+              << ", poll_threads=" << config.poll_threads
+              << ", group_cq_size=" << config.group_cq_size
+              << ", poll_wait_timeout_ms="
+              << config.poll_wait_timeout.count();
     return config;
   } catch (const std::exception& e) {
     ELOG_WARN << "URMA RPC auto enable failed: " << e.what()

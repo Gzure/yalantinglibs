@@ -157,6 +157,37 @@ TEST_CASE("urma rpc enabled without usable device keeps client constructible") {
       client.get_config().socket_config));
 }
 
+TEST_CASE("urma rpc env poll thread pool config defaults and overrides") {
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.poll_threads ==
+          coro_io::urma_socket_t::config_t{}.poll_threads);
+    CHECK(config.group_cq_size ==
+          coro_io::urma_socket_t::config_t{}.group_cq_size);
+    CHECK(config.poll_wait_timeout ==
+          coro_io::urma_socket_t::config_t{}.poll_wait_timeout);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var threads("URMA_RPC_POLL_THREADS", "8");
+    scoped_env_var cq("URMA_RPC_GROUP_CQ_SIZE", "2048");
+    scoped_env_var to("URMA_RPC_POLL_WAIT_TIMEOUT_MS", "250");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.poll_threads == 8);
+    CHECK(config.group_cq_size == 2048);
+    CHECK(config.poll_wait_timeout == std::chrono::milliseconds(250));
+  }
+  {
+    // invalid values keep defaults
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var threads("URMA_RPC_POLL_THREADS", "garbage");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.poll_threads ==
+          coro_io::urma_socket_t::config_t{}.poll_threads);
+  }
+}
+
 #else
 TEST_CASE("urma rpc env tests compile without urma support") {
   coro_rpc::coro_rpc_client client;

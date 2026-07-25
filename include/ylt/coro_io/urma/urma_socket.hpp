@@ -646,6 +646,10 @@ class urma_socket_t {
     bool event_mode = true;
     std::size_t busy_poll_budget = 16;
     std::chrono::microseconds poll_interval{5};
+    // --- poll thread pool (urma_event_mode thread-pool path) ---
+    uint32_t poll_threads = 4;  // 0 disables -> legacy path
+    uint32_t group_cq_size = 1024;  // per-group shared jfc depth
+    std::chrono::milliseconds poll_wait_timeout{100};  // urma_wait_jfc timeout
   };
 
   enum io_type { recv = 0, send = 1 };

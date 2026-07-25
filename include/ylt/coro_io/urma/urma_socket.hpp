@@ -1297,11 +1297,36 @@ class urma_socket_t {
         conf_.send_buffer_cnt, conf_.cq_size);
     state_->busy_poll_budget_ = conf_.busy_poll_budget;
     state_->idle_poll_interval_ = conf_.poll_interval;
+
+    // Select the poll path.  Thread-pool mode requires event_mode and a
+    // non-zero poll_threads; the pool singleton is lazily created with the
+    // device context.  On any failure, fall back to the legacy per-socket
+    // path.  NOTE: `device` was moved into state_ above, so the context is
+    // read back through state_->device_.
+    bool want_thread_pool = conf_.event_mode && conf_.poll_threads > 0;
+    if (want_thread_pool) {
+      urma_poll_thread_pool::config pcfg{
+          .thread_count = conf_.poll_threads,
+          .group_cq_size = conf_.group_cq_size,
+          .busy_poll_budget = conf_.busy_poll_budget,
+          .wait_timeout = conf_.poll_wait_timeout,
+          .context = state_->device_->context()};
+      auto* pool = urma_poll_thread_pool::instance(pcfg);
+      if (pool && state_->init_thread_pool(pool, conf_.group_cq_size,
+                                           conf_.send_buffer_cnt)) {
+        // thread_pool_mode_ is now true inside state_; state_->init will use
+        // the group jfc instead of creating its own.
+      } else {
+        ELOG_WARN << "URMA poll thread pool unavailable; fall back to legacy";
+        want_thread_pool = false;
+      }
+    }
+
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode)) {
       auto stage = state_->init_stage_;
       auto error = state_->init_error_;
-      ELOG_ERROR << "URMA socket resource initialization failed: stage="
-                 << stage << ", errno=" << error.value()
+      ELOG_ERROR << "URMA socket resource initialization failed: stage=" << stage
+                 << ", errno=" << error.value()
                  << ", error=" << error.message();
       state_.reset();
       throw std::system_error(error, stage);

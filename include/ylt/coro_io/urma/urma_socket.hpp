@@ -331,38 +331,30 @@ struct urma_socket_shared_state_t
 
   void async_receive(callback_t&& callback) {
     if (thread_pool_mode_) {
-      // Drain anything already handed off / queued.
-      if (auto cr = recv_handoff_.pop_queue()) {
-        recv_buffer_ = std::move(recv_pending_buffer_);
-        std::error_code ec = cr->status
+      // Thread-pool recv path: mutex-guarded single slot (mirrors the send
+      // path).  Under the lock either take a result that arrived before the
+      // coroutine suspended (complete inline), or register as the waiter
+      // (the poll thread's on_recv_completion will post finish_recv_handoff).
+      // unique_lock so we can unlock before invoking the callback.
+      std::unique_lock lk(recv_handoff_mtx_);
+      if (recv_pending_cr_) {
+        // Result arrived before the coroutine suspended: complete inline.
+        auto cr = *recv_pending_cr_;
+        recv_pending_cr_.reset();
+        bool have_buf = recv_pending_buffer_valid_;
+        recv_pending_buffer_valid_ = false;
+        if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
+        lk.unlock();
+        std::error_code ec = cr.status
             ? std::make_error_code(std::errc::io_error)
             : std::error_code{};
-        resume({ec, cr->completion_len}, std::move(callback));
+        resume({ec, cr.completion_len}, std::move(callback));
         return;
       }
-      // Nothing ready: become the waiter via the handoff state machine.
-      // Two-arg try_begin_wait publishes the resume handle BEFORE flipping to
-      // WAITING, so the poll thread can never observe WAITING without a valid
-      // handle (no lost wakeup).
-      if (recv_handoff_.try_begin_wait(
-              [](void* p) {
-                auto* self = static_cast<urma_socket_shared_state_t*>(p);
-                asio::post(self->executor_->get_asio_executor(), [self] {
-                  self->finish_recv_handoff();
-                });
-              },
-              this)) {
-        recv_pending_callback_ = std::move(callback);
-        return;  // suspended via the posted continuation
-      }
-      // try_begin_wait returned false -> state was READY: take pending now.
-      auto cr = recv_handoff_.take_pending();
-      recv_handoff_.try_finish();
-      recv_buffer_ = std::move(recv_pending_buffer_);
-      std::error_code ec = cr && cr->status
-          ? std::make_error_code(std::errc::io_error)
-          : std::error_code{};
-      resume({ec, cr ? cr->completion_len : 0}, std::move(callback));
+      // Nothing ready: register as the waiter.  The poll thread's
+      // on_recv_completion will fill recv_pending_cr_ and post
+      // finish_recv_handoff, which takes the callback under the lock.
+      recv_pending_callback_ = std::move(callback);
       return;
     }
     // --- legacy path (unchanged) ---
@@ -380,19 +372,33 @@ struct urma_socket_shared_state_t
     }
   }
 
-  // Runs on the request thread (posted by the handoff resume) to finish a
-  // recv that was handed off by the poll thread.
+  // Runs on the request thread (posted by on_recv_completion) to finish a
+  // recv that was handed off by the poll thread.  on_recv_completion fills the
+  // slot and posts this ONLY when a recv coroutine is already waiting
+  // (recv_pending_callback_ set), so both the result and the callback are
+  // present here.  Takes both under the lock, clears both, then completes the
+  // callback after unlocking.
   void finish_recv_handoff() {
-    auto cr = recv_handoff_.take_pending();
-    if (!cr) cr = recv_handoff_.pop_queue();
-    recv_handoff_.try_finish();
-    if (!recv_pending_callback_) return;
-    auto cb = std::move(recv_pending_callback_);
-    recv_buffer_ = std::move(recv_pending_buffer_);
-    std::error_code ec = cr && cr->status
+    handoff_cr cr{};
+    bool have_cr = false;
+    bool have_buf = false;
+    callback_t cb;
+    {
+      std::lock_guard lk(recv_handoff_mtx_);
+      if (!recv_pending_cr_) return;  // nothing to deliver (shouldn't happen)
+      cr = *recv_pending_cr_;
+      recv_pending_cr_.reset();
+      have_cr = true;
+      have_buf = recv_pending_buffer_valid_;
+      recv_pending_buffer_valid_ = false;
+      cb = std::move(recv_pending_callback_);
+      recv_pending_callback_ = nullptr;
+    }
+    if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
+    std::error_code ec = cr.status
         ? std::make_error_code(std::errc::io_error)
         : std::error_code{};
-    resume({ec, cr ? cr->completion_len : 0}, std::move(cb));
+    resume({ec, cr.completion_len}, std::move(cb));
   }
 
   // Called by the poll thread (via urma_poll_thread_pool::dispatch) when a
@@ -414,42 +420,43 @@ struct urma_socket_shared_state_t
     resume({ec, completion_len}, std::move(ps.callback));
   }
 
-  // Called by the poll thread when a recv CQE arrives.  Refills the recv
-  // queue, then hands the result to the recv coroutine via recv_handoff_.
+  // Called by the poll thread when a recv CQE arrives.  Fills the single recv
+  // slot under recv_handoff_mtx_ and, if a recv coroutine is already waiting,
+  // posts finish_recv_handoff to the request-thread executor.  The lock plus
+  // the inline-take path in async_receive covers both orderings (result before
+  // vs after the coroutine suspends) with no stranding window.
   void on_recv_completion(std::error_code ec, std::size_t completion_len) {
     if (completion_len == 0) {
       peer_close_ = true;
       has_close_ = true;
     }
-    if (recv_queue_.empty()) {
-      // protocol error; deliver an error result via the handoff
-      deliver_handoff(handoff_cr{0, uint32_t(std::errc::protocol_error), 0, 1});
-      return;
+    handoff_cr cr{0, static_cast<uint32_t>(ec.value()),
+                  static_cast<uint32_t>(completion_len), 1};
+    bool has_waiter = false;
+    {
+      std::lock_guard lk(recv_handoff_mtx_);
+      if (recv_queue_.empty()) {
+        // protocol error: deliver an error result (no buffer).
+        recv_pending_cr_ =
+            handoff_cr{0, uint32_t(std::errc::protocol_error), 0, 1};
+        recv_pending_buffer_valid_ = false;
+      } else {
+        recv_pending_buffer_ = recv_queue_.pop();
+        recv_pending_buffer_valid_ = true;
+        recv_pending_cr_ = cr;
+        auto refill_ec = fill_recv_queue();
+        if (refill_ec) {
+          ELOG_ERROR << "URMA refill recv queue failed: " << refill_ec.message();
+        }
+      }
+      // Note whether a recv coroutine is waiting; the callback is NOT moved
+      // here - finish_recv_handoff takes it under the lock after being posted.
+      has_waiter = static_cast<bool>(recv_pending_callback_);
     }
-    auto completed_buffer = recv_queue_.pop();
-    auto refill_ec = fill_recv_queue();
-    if (refill_ec) {
-      ELOG_ERROR << "URMA refill recv queue failed: " << refill_ec.message();
-    }
-    // Stash the completed buffer where the recv coroutine will find it, then
-    // hand off the (ec, len) result.  The buffer is held in a single-slot
-    // member guarded by the handoff state (only one recv in flight).
-    recv_pending_buffer_ = std::move(completed_buffer);
-    deliver_handoff(handoff_cr{0, static_cast<uint32_t>(ec.value()),
-                               static_cast<uint32_t>(completion_len), 1});
-  }
-
-  // Tries a direct handoff (WAITING -> READY); on success the resume handle
-  // was published before WAITING, so it is valid here and must be invoked to
-  // wake the suspended recv coroutine (it posts finish_recv_handoff onto the
-  // socket's executor).  On failure (IDLE/READY) the completion is enqueued
-  // for the next async_receive / finish_recv_handoff to drain.
-  void deliver_handoff(handoff_cr cr) {
-    if (recv_handoff_.try_deliver(cr)) {
-      auto [fn, ctx] = recv_handoff_.take_resume_handle();
-      if (fn) fn(ctx);
-    } else {
-      recv_handoff_.push_queue(cr);
+    if (has_waiter) {
+      auto self = shared_from_this();
+      asio::post(executor_->get_asio_executor(),
+                 [self] { self->finish_recv_handoff(); });
     }
   }
 
@@ -784,11 +791,18 @@ struct urma_socket_shared_state_t
   std::unordered_map<uint32_t, pending_send> pending_send_by_seq_;
   std::atomic<uint32_t> next_send_seq_{1};
   std::atomic<uint32_t> next_recv_seq_{1};
-  // recv path: single-slot lock-free handoff for the one recv coroutine that
-  // can be pending at a time.
-  completion_handoff recv_handoff_;
+  // recv path (thread-pool mode): mutex-guarded single slot, mirroring the
+  // send path's pattern.  The poll thread (on_recv_completion) fills the slot
+  // and posts the completion to the request thread; the recv coroutine
+  // (async_receive) either takes a ready result or registers as the waiter.
+  // Exactly one of recv_pending_callback_ (coroutine waiting) vs
+  // recv_pending_cr_ (result waiting) is set at a time; the lock serializes
+  // all access, so there is no stranding window and no double-resume.
+  std::mutex recv_handoff_mtx_;
+  std::optional<handoff_cr> recv_pending_cr_;       // the handed-off result
+  bool recv_pending_buffer_valid_ = false;          // recv_pending_buffer_ has data
   urma_buffer_t recv_pending_buffer_{};
-  callback_t recv_pending_callback_;
+  callback_t recv_pending_callback_;                // the waiting recv coroutine's callback
 };
 
 // Out-of-line definition of urma_poll_thread_pool::dispatch, declared in

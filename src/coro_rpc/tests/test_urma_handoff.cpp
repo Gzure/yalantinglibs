@@ -69,11 +69,17 @@ TEST_CASE("urma handoff single-thread happy path") {
 }
 
 TEST_CASE("urma handoff branch A: READY before coroutine suspends") {
+  // No-waiter path: try_deliver on IDLE returns false (no one to hand off to)
+  // and does NOT auto-enqueue; the caller must push_queue explicitly.
   completion_handoff h;
-  // poll thread delivers first, while still IDLE -> goes to queue (no waiter)
-  h.try_deliver({});  // state IDLE, not WAITING -> returns false
+  CHECK_FALSE(h.try_deliver({}));  // state IDLE, not WAITING -> false
   CHECK(h.load_state() == completion_handoff::state::IDLE);
+  CHECK(h.queue_empty());          // try_deliver did not touch the queue
+  h.push_queue({});                // caller enqueues the orphaned completion
   CHECK_FALSE(h.queue_empty());
+  auto orphan = h.pop_queue();
+  CHECK(orphan.has_value());
+  CHECK(h.queue_empty());
 
   // Now simulate: poll thread had already flipped to READY via a real
   // WAITING->READY before the coroutine checked.  Drive that path directly:

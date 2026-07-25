@@ -13,6 +13,7 @@ set(TEST_SRCS
         test_client_filter.cpp
         test_abi_compatible.cpp
         test_urma_rpc_env.cpp
+        test_urma_handoff.cpp
         )
 if (YLT_ENABLE_IBV AND YLT_ENABLE_CUDA)
         set(TEST_SRC ${TEST_SRCS} test_gdr.cpp)

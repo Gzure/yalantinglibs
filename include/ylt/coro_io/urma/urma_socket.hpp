@@ -1093,11 +1093,10 @@ inline void urma_poll_thread_pool::poll_loop(uint32_t gi) {
     if (ev > 0 && ev_jfc) {
       uint32_t ack = 1;
       urma_ack_jfc(&ev_jfc, &ack, 1);
-    } else if (ev == 0 && errno != 512 /* ERESTARTSYS */) {
-      ELOG_INFO << "urma_wait_jfc no event group=" << gi << " errno=" << errno;
     } else if (ev < 0) {
       ELOG_WARN << "urma_wait_jfc error group=" << gi;
     }
+    // ev == 0 (timeout, no event) is the normal idle case - stay quiet.
     idle_spins = 0;
   }
 }

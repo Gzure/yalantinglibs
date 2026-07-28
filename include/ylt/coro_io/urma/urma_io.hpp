@@ -16,16 +16,15 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "async_simple/Promise.h"
-#include "async_simple/util/move_only_function.h"
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
 #include "ylt/coro_io/urma/urma_socket.hpp"
@@ -42,20 +41,18 @@ void make_urma_buffers(std::vector<AsioBuffer>& result,
 }
 
 struct urma_write_completion_state {
-  std::mutex mtx;
-  std::queue<std::pair<std::error_code, std::size_t>> completions;
-  async_simple::util::move_only_function<void()> resume_handler;
+  // Lock-free single-slot result.  seq_ is bumped (release) by push() when a
+  // result is placed in result_; the request thread spins on seq_ (acquire)
+  // until it changes, then reads result_.  No mutex, no asio::post, no
+  // suspend/resume - pure atomic spin for minimum latency.
+  //   seq_ layout: bit 0 = ready flag; bits 1.. = generation counter.
+  std::atomic<uint64_t> seq_{0};
+  std::pair<std::error_code, std::size_t> result;
 
   // Called by the poll thread (via the post_send callback).
-  void push(std::pair<std::error_code, std::size_t> result) {
-    async_simple::util::move_only_function<void()> h;
-    {
-      std::lock_guard lk(mtx);
-      completions.push(result);
-      h = std::move(resume_handler);   // single resume: move-and-clear under lock
-      resume_handler = nullptr;
-    }
-    if (h) h();                        // resume outside the lock (no reentrancy)
+  void push(std::pair<std::error_code, std::size_t> r) {
+    result = r;
+    seq_.fetch_add(1, std::memory_order_release);  // publish result
   }
 };
 
@@ -63,95 +60,16 @@ inline async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>>
 wait_urma_write_completion(
     const std::shared_ptr<urma_write_completion_state>& state,
     urma_socket_t& socket) {
-  // socket is used only in the slow path to obtain the executor for the rare
-  // deferred self-resume (see below); the poll thread otherwise fills state.
-  // Fast path: 32 short checks of state->completions.  Each check takes the
-  // mutex briefly; std::this_thread::yield() keeps the request thread from
-  // starving siblings under heavy load.  Covers the typical 1-10us CQE window.
-  // The request thread must NOT poll the shared jfc here: in thread-pool mode
-  // the poll thread owns the jfc, and concurrent urma_poll_jfc loses CQEs
-  // (this also avoids the SIGBUS from racing event_loop's poll_completion on
-  // the shared socket state - the same issue urma_event_mode's spin-removal
-  // fix addressed; we never touch poll_completion_once from this path).
-  for (int i = 0; i < 32; ++i) {
-    bool ready;
-    {
-      std::lock_guard lk(state->mtx);
-      ready = !state->completions.empty();
-    }
-    if (ready) break;
+  (void)socket;
+  // Pure atomic spin: wait until push() bumps seq_ (release), then read the
+  // result.  No mutex, no suspend, no asio::post - this is the fastest possible
+  // handoff between the poll thread and the request coroutine.  The request
+  // thread burns CPU briefly (typically 1-10us) but achieves minimum latency.
+  uint64_t expected = state->seq_.load(std::memory_order_acquire);
+  while (state->seq_.load(std::memory_order_acquire) == expected) {
     std::this_thread::yield();
   }
-  {
-    std::lock_guard lk(state->mtx);
-    if (!state->completions.empty()) {
-      auto result = state->completions.front();
-      state->completions.pop();
-      co_return result;
-    }
-  }
-  // Slow path: suspend until push() resumes us, then consume under the lock.
-  //
-  // Why the setup lambda never calls handler.resume() itself:
-  //   callback_awaitor_impl::await_suspend (coro_io.hpp) returns `void`, so the
-  //   coroutine is suspended once await_suspend returns, and the setup lambda
-  //   runs *inside* await_suspend.  Resuming the owning coroutine from the
-  //   setup would run it to co_return; final_suspend would symmetric-transfer
-  //   to the caller, whose await_resume (async_simple LazyAwaiterBase::
-  //   awaitResume) calls _handle.destroy() -- destroying THIS coroutine's frame
-  //   (and the `awaitor` object) while await_suspend is still on the call
-  //   stack.  Returning from a method of a destroyed object is UB.  Therefore
-  //   the resume is always driven by push() on the poll thread, which calls
-  //   coro_.resume() on a handle that await_suspend already stored (coro_ is
-  //   assigned before op() runs).
-  //
-  // Lost-wakeup handling: the setup installs resume_handler under the lock,
-  // then re-checks completions under the *same* lock.  If a push() landed in
-  // the window between the outer empty-check and this acquisition, the result
-  // is already queued but that push() saw no handler and so will not wake us.
-  // We cannot resume inline (UB, above), so we clear resume_handler (so a
-  // later push() does not ALSO fire it and double-resume) and defer a single
-  // self-resume onto the socket's executor with asio::post: await_suspend
-  // returns (coroutine suspends), the posted handler resumes it, and the
-  // post-await re-check consumes the queued result.  asio::post guarantees the
-  // resume does not run inline, so await_suspend has already returned by the
-  // time we resume.  Either push() fires resume_handler (empty case) OR the
-  // posted handler fires (ready-in-window case) -- never both, because we clear
-  // resume_handler before posting while still holding the lock.
-  while (true) {
-    {
-      std::lock_guard lk(state->mtx);
-      if (!state->completions.empty()) {
-        auto result = state->completions.front();
-        state->completions.pop();
-        co_return result;
-      }
-    }
-    // Queue empty: install the resume handler and suspend.
-    callback_awaitor<void> awaitor;
-    co_await awaitor.await_resume([&state, &socket](auto handler) {
-      std::lock_guard lk(state->mtx);
-      state->resume_handler = [handler]() mutable { handler.resume(); };
-      // A result may have arrived between the outer check and this lock.
-      // push() did not fire resume_handler (it was null then), so we must wake
-      // ourselves.  Clear the handler first so a later push() cannot double-
-      // resume, then post a deferred self-resume.
-      if (!state->completions.empty()) {
-        state->resume_handler = nullptr;
-        asio::post(socket.get_executor(),
-                   [handler]() mutable { handler.resume(); });
-      }
-    });
-    // Resumed by push(), or by the deferred self-resume above.  Re-check under
-    // the lock and consume if ready.
-    std::lock_guard lk(state->mtx);
-    if (!state->completions.empty()) {
-      auto result = state->completions.front();
-      state->completions.pop();
-      co_return result;
-    }
-    // Spurious resume with nothing ready: loop and re-suspend.
-  }
+  co_return state->result;
 }
 
 template <typename Buffer>

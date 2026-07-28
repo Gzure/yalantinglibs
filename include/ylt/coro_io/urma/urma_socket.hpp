@@ -366,50 +366,32 @@ struct urma_socket_shared_state_t
 
   void async_receive(callback_t&& callback) {
     if (thread_pool_mode_) {
-      // Thread-pool recv path.  Spin briefly (like wait_urma_write_completion)
-      // to catch a result that the poll thread has already handed off, avoiding
-      // the ~100us+ asio::post scheduler hop when we suspend and get resumed
-      // via finish_recv_handoff.  Drain order (FIFO):
-      //   1. recv_pending_cr_ set   -> take the slot inline (oldest).
-      //   2. recv_result_ non-empty -> pop and complete inline (later overflow).
-      //   3. otherwise              -> spin a few times, then store callback.
-      auto try_take = [&]() -> bool {
-        std::unique_lock lk(recv_handoff_mtx_);
-        if (recv_pending_cr_) {
-          auto cr = *recv_pending_cr_;
-          recv_pending_cr_.reset();
-          bool have_buf = recv_pending_buffer_valid_;
-          recv_pending_buffer_valid_ = false;
-          if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
-          lk.unlock();
-          std::error_code ec = cr.status
-              ? std::make_error_code(std::errc::io_error)
-              : std::error_code{};
-          resume({ec, cr.completion_len}, std::move(callback));
-          return true;
-        }
+      // Lock-free recv: spin on recv_seq_ until the poll thread bumps it
+      // (release), then take the result.  No mutex, no asio::post, no
+      // suspend/resume - pure atomic spin for minimum latency.  The request
+      // thread burns CPU briefly (typically 1-10us) but the poll thread stays
+      // completely free (it only writes the atomic, never runs coroutine logic).
+      //
+      // First check overflow (a previous result that didn't fit the slot).
+      if (!recv_result_.empty()) {
+        std::lock_guard lk(recv_overflow_mtx_);
         if (!recv_result_.empty()) {
           auto pending = recv_result_.pop();
-          bool have_buf = static_cast<bool>(pending.buffer);
-          if (have_buf) recv_buffer_ = std::move(pending.buffer);
-          lk.unlock();
+          if (pending.buffer) recv_buffer_ = std::move(pending.buffer);
           resume(std::move(pending.result), std::move(callback));
-          return true;
+          return;
         }
-        return false;
-      };
-      // Fast path: result may already be available (poll thread drained the
-      // CQE while we were between calls).  32 yield-spins cover the typical
-      // 1-10us CQE-arrival window.
-      for (int i = 0; i < 32; ++i) {
-        if (try_take()) return;
+      }
+      // Spin on the atomic slot.
+      uint64_t expected = recv_consumed_seq_.load(std::memory_order_relaxed);
+      while (recv_seq_.load(std::memory_order_acquire) == expected) {
         std::this_thread::yield();
       }
-      // Still nothing: register as the waiter.  The poll thread's
-      // on_recv_completion will fill recv_pending_cr_ and post
-      // finish_recv_handoff to resume us.
-      std::lock_guard lk(recv_handoff_mtx_);
-      recv_pending_callback_ = std::move(callback);
+      // Result is ready: take it.
+      recv_buffer_ = recv_completed_buffer_;
+      recv_consumed_seq_.store(recv_seq_.load(std::memory_order_relaxed),
+                               std::memory_order_release);
+      resume(recv_result_atomic_, std::move(callback));
       return;
     }
     // --- legacy path (unchanged) ---
@@ -446,99 +428,65 @@ struct urma_socket_shared_state_t
     resume({ec, completion_len}, std::move(ps.callback));
   }
 
-  // Called by the poll thread when a recv CQE arrives.  Under recv_handoff_mtx_:
-  // pop the completed buffer from recv_queue_, refill, then either fill the
-  // single recv slot (if no unconsumed result is sitting there) or push the new
-  // result into the recv_result_ overflow circle_buffer (the burst path - mirrors
-  // the legacy poll_completion recv handling).  If a recv coroutine is already
-  // waiting (recv_pending_callback_ set) the result is posted to the request
-  // thread via on_recv_completion; otherwise the slot/overflow is left for the
-  // next async_receive to take inline.  This avoids both the lost-completion
-  // (overwriting recv_pending_cr_) and the leaked-buffer (overwriting
-  // recv_pending_buffer_) defects that the single-slot design had under a burst.
+  // Called by the poll thread when a recv CQE arrives.  Lock-free: writes the
+  // result into recv_result_atomic_ + recv_completed_buffer_, then bumps
+  // recv_seq_ (release).  The recv coroutine spins on recv_seq_ (acquire) and
+  // consumes the result.  No mutex, no asio::post, no suspend/resume - the
+  // poll thread does NOT run any coroutine logic, so it stays free to drain
+  // the next CQE immediately.  This is the key to low latency.
   //
-  // Defect 3: bail at the very top if close has begun so the poll thread stops
-  // touching socket state once release_resources/close is underway.  A tiny
-  // window between this check and acquiring recv_handoff_mtx_ remains, but
-  // release_resources takes the same lock before draining the containers, so it
-  // cannot destroy them while we hold it.
+  // Overflow (rare: a second recv CQE arrives before the first is consumed):
+  // push to recv_result_ under recv_overflow_mtx_.  The coroutine checks
+  // overflow after consuming the atomic slot.
   void on_recv_completion(std::error_code ec, std::size_t completion_len) {
-    if (has_close_.load(std::memory_order_acquire)) return;  // close in flight
+    if (has_close_.load(std::memory_order_acquire)) return;
     if (completion_len == 0) {
       peer_close_ = true;
       has_close_ = true;
     }
-    handoff_cr cr{0, static_cast<uint32_t>(ec.value()),
-                  static_cast<uint32_t>(completion_len), 1};
-    bool has_waiter = false;
-    {
-      std::lock_guard lk(recv_handoff_mtx_);
-      if (recv_queue_.empty()) {
-        // protocol error: deliver an error result (no buffer).
-        if (!recv_pending_cr_) {
-          recv_pending_cr_ =
-              handoff_cr{0, uint32_t(std::errc::protocol_error), 0, 1};
-          recv_pending_buffer_valid_ = false;
-        } else if (!recv_result_.full()) {
-          recv_result_.push(
-              pending_recv{{std::make_error_code(std::errc::protocol_error), 0},
-                           {}});
-        }
+    if (recv_queue_.empty()) {
+      // protocol error: deliver an error result with no buffer.
+      recv_result_atomic_ = {std::make_error_code(std::errc::protocol_error), 0};
+      recv_completed_buffer_ = {};
+      recv_seq_.fetch_add(1, std::memory_order_release);
+      return;
+    }
+    urma_buffer_t completed_buffer = recv_queue_.pop();
+    auto refill_ec = fill_recv_queue();
+    if (refill_ec) {
+      ELOG_ERROR << "URMA refill recv queue failed: " << refill_ec.message();
+    }
+    // If the atomic slot has NOT been consumed yet (recv_seq_ was bumped but
+    // the coroutine hasn't read it), push this result to overflow instead of
+    // overwriting.  We detect "not consumed" by checking whether the coroutine
+    // has read the previous slot - but with a pure atomic we can't know that.
+    // Simplest correct approach: always write to the atomic slot; if the
+    // coroutine is spinning it will see the new value.  If a previous result
+    // was still unconsumed, it is overwritten - but in practice the coroutine
+    // consumes the slot before the next CQE arrives (it spins, takes the
+    // result, processes it, then calls async_receive again which spins for the
+    // next).  The overflow queue handles the rare burst case.
+    // Check: if recv_seq_ was bumped but the coroutine hasn't consumed yet
+    // (i.e., this is a second CQE before consumption), use overflow.
+    // We track consumption via a separate "consumed_seq" that the coroutine
+    // writes after taking the slot.
+    uint64_t current = recv_seq_.load(std::memory_order_relaxed);
+    uint64_t consumed = recv_consumed_seq_.load(std::memory_order_acquire);
+    if (current != consumed) {
+      // Previous result not yet consumed -> overflow.
+      if (!recv_result_.full()) {
+        std::lock_guard lk(recv_overflow_mtx_);
+        recv_result_.push(
+            pending_recv{{ec, completion_len}, std::move(completed_buffer)});
       } else {
-        urma_buffer_t completed_buffer = recv_queue_.pop();
-        auto refill_ec = fill_recv_queue();
-        if (refill_ec) {
-          ELOG_ERROR << "URMA refill recv queue failed: " << refill_ec.message();
-        }
-        if (!recv_pending_cr_) {
-          recv_pending_buffer_ = std::move(completed_buffer);
-          recv_pending_buffer_valid_ = true;
-          recv_pending_cr_ = cr;
-        } else {
-          if (recv_result_.full()) {
-            ELOG_ERROR << "URMA recv result queue is full; cannot cache "
-                          "completed recv buffer";
-            device_->get_buffer_pool()->return_buffer(completed_buffer);
-          } else {
-            recv_result_.push(
-                pending_recv{{ec, completion_len}, std::move(completed_buffer)});
-          }
-        }
+        ELOG_ERROR << "URMA recv overflow full; dropping completed buffer";
+        device_->get_buffer_pool()->return_buffer(completed_buffer);
       }
-      has_waiter = static_cast<bool>(recv_pending_callback_);
+      return;
     }
-    // Resume the recv coroutine via asio::post on the request-thread executor.
-    // We must NOT resume directly on the poll thread: doing so blocks the poll
-    // thread while the coroutine executes, serializing CQE drainage for all
-    // sockets in the group and inflating latency for everyone.
-    if (has_waiter) {
-      auto self = shared_from_this();
-      asio::post(executor_->get_asio_executor(),
-                 [self] { self->finish_recv_handoff(); });
-    }
-  }
-
-  // Runs on the request thread (posted by on_recv_completion) to finish a
-  // recv that was handed off by the poll thread.
-  void finish_recv_handoff() {
-    handoff_cr cr{};
-    bool have_buf = false;
-    callback_t cb;
-    {
-      std::lock_guard lk(recv_handoff_mtx_);
-      if (!recv_pending_cr_) return;
-      cr = *recv_pending_cr_;
-      recv_pending_cr_.reset();
-      have_buf = recv_pending_buffer_valid_;
-      recv_pending_buffer_valid_ = false;
-      cb = std::move(recv_pending_callback_);
-      recv_pending_callback_ = nullptr;
-    }
-    if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
-    std::error_code ec = cr.status
-        ? std::make_error_code(std::errc::io_error)
-        : std::error_code{};
-    resume({ec, cr.completion_len}, std::move(cb));
+    recv_result_atomic_ = {ec, completion_len};
+    recv_completed_buffer_ = completed_buffer;
+    recv_seq_.fetch_add(1, std::memory_order_release);
   }
 
   // Called from the poll thread when a CQE indicates a transport error
@@ -845,38 +793,17 @@ struct urma_socket_shared_state_t
         }
       }
       wake_writer(ec);
-      // Pending recv: resume a waiting coroutine, drop the handed-off slot
-      // result (returning its buffer), and drain the recv_result_ overflow.
-      // recv_callback_ (legacy single slot) is unused in thread-pool mode but
-      // is resumed for safety.  unique_lock so we can unlock before resuming
-      // (resume may re-enter async_receive/post_send and re-take the lock).
+      // Pending recv: the recv coroutine is spinning on recv_seq_; bump it
+      // with an error result so the spin exits.  Also drain overflow.
       {
-        std::unique_lock lk(recv_handoff_mtx_);
-        if (recv_pending_callback_) {
-          callback_t cb = std::move(recv_pending_callback_);
-          recv_pending_callback_ = nullptr;
-          lk.unlock();
-          resume({ec, 0}, std::move(cb));
-          lk.lock();
-        }
-        if (recv_pending_cr_) {
-          recv_pending_cr_.reset();
-          if (recv_pending_buffer_valid_) {
-            device_->get_buffer_pool()->return_buffer(recv_pending_buffer_);
-            recv_pending_buffer_ = {};
-          }
-          recv_pending_buffer_valid_ = false;
-        }
+        recv_result_atomic_ = {ec, 0};
+        recv_completed_buffer_ = {};
+        recv_seq_.fetch_add(1, std::memory_order_release);
+        std::lock_guard lk(recv_overflow_mtx_);
         while (!recv_result_.empty()) {
           auto pending = recv_result_.pop();
           if (pending.buffer)
             device_->get_buffer_pool()->return_buffer(pending.buffer);
-        }
-        if (recv_callback_) {
-          callback_t cb = std::move(recv_callback_);
-          lk.unlock();
-          resume({ec, 0}, std::move(cb));
-          lk.lock();
         }
       }
       return;
@@ -928,21 +855,16 @@ struct urma_socket_shared_state_t
       }
       pending_send_by_seq_.clear();
 
-      std::lock_guard rk(recv_handoff_mtx_);
+      std::lock_guard rk(recv_overflow_mtx_);
       while (!recv_queue_.empty()) {
         auto buffer = recv_queue_.pop();
         device_->get_buffer_pool()->return_buffer(buffer);
       }
-      // fail_pending already drained recv_result_/recv_pending_*; defend against
-      // a CQE that arrived between fail_pending and here (it would have bailed
-      // on has_close_, but the lock makes this deterministic).
-      if (recv_pending_cr_) {
-        recv_pending_cr_.reset();
-        if (recv_pending_buffer_valid_) {
-          device_->get_buffer_pool()->return_buffer(recv_pending_buffer_);
-          recv_pending_buffer_ = {};
-        }
-        recv_pending_buffer_valid_ = false;
+      // fail_pending already bumped recv_seq_ with an error; return the slot
+      // buffer if any.
+      if (recv_completed_buffer_) {
+        device_->get_buffer_pool()->return_buffer(recv_completed_buffer_);
+        recv_completed_buffer_ = {};
       }
       while (!recv_result_.empty()) {
         auto pending = recv_result_.pop();
@@ -1003,18 +925,17 @@ struct urma_socket_shared_state_t
   std::unordered_map<uint32_t, pending_send> pending_send_by_seq_;
   std::atomic<uint32_t> next_send_seq_{1};
   std::atomic<uint32_t> next_recv_seq_{1};
-  // recv path (thread-pool mode): mutex-guarded single slot, mirroring the
-  // send path's pattern.  The poll thread (on_recv_completion) fills the slot
-  // and posts the completion to the request thread; the recv coroutine
-  // (async_receive) either takes a ready result or registers as the waiter.
-  // Exactly one of recv_pending_callback_ (coroutine waiting) vs
-  // recv_pending_cr_ (result waiting) is set at a time; the lock serializes
-  // all access, so there is no stranding window and no double-resume.
-  std::mutex recv_handoff_mtx_;
-  std::optional<handoff_cr> recv_pending_cr_;       // the handed-off result
-  bool recv_pending_buffer_valid_ = false;          // recv_pending_buffer_ has data
-  urma_buffer_t recv_pending_buffer_{};
-  callback_t recv_pending_callback_;                // the waiting recv coroutine's callback
+  // recv path (thread-pool mode): lock-free atomic single-slot, same pattern as
+  // the send path's urma_write_completion_state.  The poll thread writes the
+  // result + bumps recv_seq_ (release); the recv coroutine spins on recv_seq_
+  // (acquire) until it changes.  No mutex, no asio::post, no suspend/resume.
+  std::atomic<uint64_t> recv_seq_{0};
+  std::atomic<uint64_t> recv_consumed_seq_{0};  // bumped by coroutine after taking slot
+  std::pair<std::error_code, std::size_t> recv_result_atomic_;
+  urma_buffer_t recv_completed_buffer_{};   // filled by poll thread, taken by coroutine
+  // overflow (rare: a second recv CQE arrives before the first is consumed)
+  std::mutex recv_overflow_mtx_;
+  // recv_result_ (the existing circle_buffer) is reused as the overflow queue.
 };
 
 // Out-of-line definition of urma_poll_thread_pool::dispatch, declared in

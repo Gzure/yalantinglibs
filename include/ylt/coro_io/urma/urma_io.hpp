@@ -19,12 +19,14 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "async_simple/Promise.h"
+#include "async_simple/util/move_only_function.h"
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
 #include "ylt/coro_io/urma/urma_socket.hpp"
@@ -41,18 +43,30 @@ void make_urma_buffers(std::vector<AsioBuffer>& result,
 }
 
 struct urma_write_completion_state {
-  // Lock-free single-slot result.  seq_ is bumped (release) by push() when a
-  // result is placed in result_; the request thread spins on seq_ (acquire)
-  // until it changes, then reads result_.  No mutex, no asio::post, no
-  // suspend/resume - pure atomic spin for minimum latency.
-  //   seq_ layout: bit 0 = ready flag; bits 1.. = generation counter.
+  // Lock-free single-slot result with a spin-then-suspend fallback.
+  // seq_ is bumped (release) by push() when a result is placed in result_.
+  // The request thread first spins on seq_ (acquire) for a short budget
+  // (fast path, ~1-10us, no scheduler hop); if the result hasn't arrived
+  // it falls back to suspend + asio::post resume (slow path, for throughput
+  // mode where many connections share executor threads and spinning would
+  // starve other coroutines).
   std::atomic<uint64_t> seq_{0};
   std::pair<std::error_code, std::size_t> result;
+  std::mutex mtx;
+  async_simple::util::move_only_function<void()> resume_handler;
 
   // Called by the poll thread (via the post_send callback).
   void push(std::pair<std::error_code, std::size_t> r) {
     result = r;
-    seq_.fetch_add(1, std::memory_order_release);  // publish result
+    seq_.fetch_add(1, std::memory_order_release);  // publish result (spin path)
+    // Also fire the resume handler if the coroutine suspended (slow path).
+    async_simple::util::move_only_function<void()> h;
+    {
+      std::lock_guard lk(mtx);
+      h = std::move(resume_handler);
+      resume_handler = nullptr;
+    }
+    if (h) h();
   }
 };
 
@@ -61,15 +75,41 @@ wait_urma_write_completion(
     const std::shared_ptr<urma_write_completion_state>& state,
     urma_socket_t& socket) {
   (void)socket;
-  // Pure atomic spin: wait until push() bumps seq_ (release), then read the
-  // result.  No mutex, no suspend, no asio::post - this is the fastest possible
-  // handoff between the poll thread and the request coroutine.  The request
-  // thread burns CPU briefly (typically 1-10us) but achieves minimum latency.
+  // Fast path: spin on the atomic for up to 64 iterations.  In latency mode
+  // (serial, one connection) the CQE arrives in 1-10us and the spin catches
+  // it with zero scheduler overhead.  yield() lets other coroutines on the
+  // same thread run between checks.
   uint64_t expected = state->seq_.load(std::memory_order_acquire);
-  while (state->seq_.load(std::memory_order_acquire) == expected) {
+  for (int i = 0; i < 64; ++i) {
+    if (state->seq_.load(std::memory_order_acquire) != expected) {
+      co_return state->result;
+    }
     std::this_thread::yield();
   }
-  co_return state->result;
+  // Slow path: the result hasn't arrived within the spin budget.  Suspend and
+  // let the poll thread resume us via push() -> resume_handler.  This avoids
+  // burning CPU in throughput mode where many connections share the executor.
+  while (true) {
+    {
+      std::lock_guard lk(state->mtx);
+      // Re-check under the lock: the result may have arrived between the last
+      // spin and here.
+      if (state->seq_.load(std::memory_order_acquire) != expected) {
+        co_return state->result;
+      }
+      // Install the resume handler; push() will fire it.
+    }
+    callback_awaitor<void> awaitor;
+    co_await awaitor.await_resume([&state](auto handler) {
+      std::lock_guard lk(state->mtx);
+      state->resume_handler = [handler]() mutable { handler.resume(); };
+    });
+    // Resumed by push().  Re-check.
+    if (state->seq_.load(std::memory_order_acquire) != expected) {
+      co_return state->result;
+    }
+    // Spurious resume: loop and re-suspend.
+  }
 }
 
 template <typename Buffer>

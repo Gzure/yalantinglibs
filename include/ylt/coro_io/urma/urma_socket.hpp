@@ -958,7 +958,7 @@ struct urma_socket_shared_state_t
   bool peer_close_ = false;
   bool event_mode_enabled_ = false;
   std::size_t busy_poll_budget_ = 16;
-  std::chrono::microseconds idle_poll_interval_{5000};
+  std::chrono::microseconds idle_poll_interval_{5};
   static constexpr std::size_t max_active_poll_budget_ = 64;
   std::size_t active_poll_budget_ = max_active_poll_budget_;
   std::string init_stage_;
@@ -1195,8 +1195,8 @@ class urma_socket_t {
                           : 0;
     auto ec =
         co_await coro_io::async_connect(executor_, state_->socket_, host, port);
-    coro_io::urma_benchmark_profile::record_since(
-        coro_io::urma_benchmark_profile::stage::client_connect_tcp, tcp_begin);
+    coro_io::urma_benchmark_profile::record_since_with_size(
+        coro_io::urma_benchmark_profile::stage::client_connect_tcp, tcp_begin, 0);
     if (!ec) ec = co_await connect_impl();
     if (ec) close();
     co_return ec;
@@ -1209,8 +1209,8 @@ class urma_socket_t {
                           ? coro_io::urma_benchmark_profile::now_ns()
                           : 0;
     auto ec = co_await coro_io::async_connect(state_->socket_, endpoint);
-    coro_io::urma_benchmark_profile::record_since(
-        coro_io::urma_benchmark_profile::stage::client_connect_tcp, tcp_begin);
+    coro_io::urma_benchmark_profile::record_since_with_size(
+        coro_io::urma_benchmark_profile::stage::client_connect_tcp, tcp_begin, 0);
     if (!ec) ec = co_await connect_impl();
     if (ec) close();
     co_return ec;
@@ -1585,9 +1585,9 @@ class urma_socket_t {
     if (ec) co_return ec;
     record_handshake_endpoints();
     close_handshake_socket();
-    coro_io::urma_benchmark_profile::record_since(
+    coro_io::urma_benchmark_profile::record_since_with_size(
         coro_io::urma_benchmark_profile::stage::client_connect_handshake,
-        handshake_begin);
+        handshake_begin, 0);
     state_->start_completion_watch();
     co_return std::error_code{};
   }

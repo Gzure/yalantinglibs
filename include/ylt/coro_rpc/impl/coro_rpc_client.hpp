@@ -1474,6 +1474,7 @@ class coro_rpc_client {
     std::atomic<uint32_t> recving_cnt_ = 0;
     std::atomic<bool> recv_running_ = false;
     uint64_t client_id = 0;
+    std::size_t last_req_payload_size = 0;
     control_t(coro_io::ExecutorWrapper<> *executor, bool is_timeout,
               const std::string &local_ip)
         : is_timeout_(is_timeout),
@@ -1585,9 +1586,6 @@ class coro_rpc_client {
                                ? coro_io::urma_benchmark_profile::now_ns()
                                : 0;
       ret = co_await coro_io::async_read(socket, asio::buffer(buffer));
-      coro_io::urma_benchmark_profile::record_since(
-          coro_io::urma_benchmark_profile::stage::client_recv_header,
-          profile_begin);
       [[maybe_unused]] auto ec = struct_pack::deserialize_to<
           struct_pack::sp_config::DISABLE_ALL_META_INFO>(
           header, std::string_view{buffer, buffer + sizeof(buffer)});
@@ -1617,6 +1615,9 @@ class coro_rpc_client {
                  << ", client_id: " << controller->client_id;
       uint32_t body_len = header.length;
       auto resp_payload_size = body_len + header.attach_length;
+      coro_io::urma_benchmark_profile::record_since_with_size(
+          coro_io::urma_benchmark_profile::stage::client_recv_header,
+          profile_begin, resp_payload_size);
       struct_pack::detail::resize(
           controller->resp_buffer_.read_buf_,
           std::max<uint32_t>(body_len, sizeof(std::string)));
@@ -1765,11 +1766,19 @@ class coro_rpc_client {
   static async_simple::coro::Lazy<async_rpc_result<T>> deserialize_rpc_result(
       async_simple::Future<async_rpc_raw_result> future,
       std::weak_ptr<control_t> watcher, recving_guard guard,
-      uint64_t client_id) {
+      uint64_t client_id, uint64_t rpc_begin = 0,
+      std::size_t req_payload_size = 0) {
+    auto record_rpc = [&]() {
+      if (rpc_begin)
+        coro_io::urma_benchmark_profile::record_since_with_size(
+            coro_io::urma_benchmark_profile::stage::benchmark_rpc_call,
+            rpc_begin, req_payload_size);
+    };
     auto ret_ = co_await std::move(future);
     guard.release();
     if (ret_.index() == 1) [[unlikely]] {  // local error
       auto &ret = std::get<1>(ret_);
+      record_rpc();
       if (ret.value() == static_cast<int>(std::errc::operation_canceled) ||
           ret.value() == static_cast<int>(std::errc::timed_out)) {
         co_return coro_rpc::unexpected<rpc_error>{
@@ -1791,6 +1800,7 @@ class coro_rpc_client {
     coro_io::urma_benchmark_profile::record_since_with_size(
         coro_io::urma_benchmark_profile::stage::client_deserialize_response,
         deser_begin, ret.buffer_.read_buf_.size());
+    record_rpc();
     if (has_error) {
       if (auto w = watcher.lock(); w) {
         close_socket_async(std::move(w));
@@ -1850,6 +1860,9 @@ class coro_rpc_client {
       async_rpc_result<decltype(get_return_type<func>())>>>
   send_request(request_config_t config, Args &&...args) {
     using rpc_return_t = decltype(get_return_type<func>());
+    auto rpc_begin = coro_io::urma_benchmark_profile::enabled()
+                         ? coro_io::urma_benchmark_profile::now_ns()
+                         : 0;
     recving_guard guard(control_.get());
     uint32_t id;
     if (!config.request_timeout_duration) {
@@ -1893,7 +1906,8 @@ class coro_rpc_client {
         }
         co_return deserialize_rpc_result<rpc_return_t>(
             std::move(future), std::weak_ptr<control_t>{control_},
-            std::move(guard), config_.client_id);
+            std::move(guard), config_.client_id, rpc_begin,
+            control_->last_req_payload_size);
       }
     }
     else {
@@ -1916,6 +1930,7 @@ class coro_rpc_client {
     auto buffer = prepare_buffer<func>(id, req_attachment.size(),
                                        std::forward<Args>(args)...);
     auto payload_size = buffer.size() + req_attachment.size();
+    control_->last_req_payload_size = payload_size;
     coro_io::urma_benchmark_profile::record_since_with_size(
         coro_io::urma_benchmark_profile::stage::client_prepare_request,
         prepare_begin, payload_size);

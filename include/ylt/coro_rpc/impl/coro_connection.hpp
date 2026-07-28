@@ -253,9 +253,9 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
       else {
         ec = co_await rpc_protocol::read_head(socket, req_head_tmp);
       }
-      coro_io::urma_benchmark_profile::record_since(
+      coro_io::urma_benchmark_profile::record_since_with_size(
           coro_io::urma_benchmark_profile::stage::server_read_header,
-          profile_begin);
+          profile_begin, req_head_tmp.length + req_head_tmp.attach_length);
       // `co_await async_read` uses asio::async_read underlying.
       // If eof occurred, the bytes_transferred of `co_await async_read` must
       // less than RPC_HEAD_LEN. Incomplete data will be discarded.
@@ -505,9 +505,9 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
                           : 0;
     std::string header_buf = rpc_protocol::prepare_response(
         body_buf, req_head, resp_attachment().size());
-    coro_io::urma_benchmark_profile::record_since(
+    coro_io::urma_benchmark_profile::record_since_with_size(
         coro_io::urma_benchmark_profile::stage::server_serialize_response,
-        ser_begin);
+        ser_begin, body_buf.size() + resp_attachment().size());
     asio::dispatch(
         socket_wrapper_.get_executor()->get_asio_executor(),
         [watcher = weak_from_this(), header_buf = std::move(header_buf),
@@ -537,9 +537,9 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
                           : 0;
     std::string header_buf =
         rpc_protocol::prepare_response(body_buf, req_head, 0, ec, error_msg);
-    coro_io::urma_benchmark_profile::record_since(
+    coro_io::urma_benchmark_profile::record_since_with_size(
         coro_io::urma_benchmark_profile::stage::server_serialize_response,
-        ser_begin);
+        ser_begin, body_buf.size());
     asio::dispatch(
         socket_wrapper_.get_executor()->get_asio_executor(),
         [watcher = weak_from_this(), header_buf = std::move(header_buf),
@@ -732,9 +732,9 @@ class coro_connection : public std::enable_shared_from_this<coro_connection> {
     write_queue_.emplace_back(std::move(header_buf), std::move(body_buf),
                               std::move(resp_attachment),
                               std::move(complete_handler));
-    coro_io::urma_benchmark_profile::record_since(
+    coro_io::urma_benchmark_profile::record_since_with_size(
         coro_io::urma_benchmark_profile::stage::server_response_queue,
-        response_begin);
+        response_begin, 0);
     --rpc_processing_cnt_;
     assert(rpc_processing_cnt_ >= 0);
     ELOG_INFO << "finish rpc function execution, conn_id = " << conn_id_

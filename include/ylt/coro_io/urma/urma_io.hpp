@@ -69,7 +69,10 @@ wait_urma_write_completion(
   // mutex briefly; std::this_thread::yield() keeps the request thread from
   // starving siblings under heavy load.  Covers the typical 1-10us CQE window.
   // The request thread must NOT poll the shared jfc here: in thread-pool mode
-  // the poll thread owns the jfc, and concurrent urma_poll_jfc loses CQEs.
+  // the poll thread owns the jfc, and concurrent urma_poll_jfc loses CQEs
+  // (this also avoids the SIGBUS from racing event_loop's poll_completion on
+  // the shared socket state - the same issue urma_event_mode's spin-removal
+  // fix addressed; we never touch poll_completion_once from this path).
   for (int i = 0; i < 32; ++i) {
     bool ready;
     {
@@ -177,9 +180,9 @@ async_urma_read(urma_socket_t& socket, Buffer&& raw_buffer, bool read_some) {
                 socket.post_recv(std::move(callback));
               },
               socket);
-      urma_benchmark_profile::record_since(
+      urma_benchmark_profile::record_since_with_size(
           urma_benchmark_profile::stage::urma_read_wait_completion,
-          wait_begin);
+          wait_begin, length);
       if (ec) co_return std::pair{ec, completed};
       auto recv = socket.get_recv_buffer();
       auto count = std::min<std::size_t>(length, buffer.size());
@@ -187,8 +190,8 @@ async_urma_read(urma_socket_t& socket, Buffer&& raw_buffer, bool read_some) {
                             ? urma_benchmark_profile::now_ns()
                             : 0;
       std::memcpy(buffer.data(), reinterpret_cast<void*>(recv.addr), count);
-      urma_benchmark_profile::record_since(
-          urma_benchmark_profile::stage::urma_read_copy, copy_begin);
+      urma_benchmark_profile::record_since_with_size(
+          urma_benchmark_profile::stage::urma_read_copy, copy_begin, count);
       buffer += count;
       completed += count;
       socket.set_read_buffer_len(count, length - count);
@@ -223,8 +226,8 @@ async_urma_read_views(urma_socket_t& socket, std::size_t size) {
               socket.post_recv(std::move(callback));
             },
             socket);
-    urma_benchmark_profile::record_since(
-        urma_benchmark_profile::stage::urma_read_wait_completion, wait_begin);
+    urma_benchmark_profile::record_since_with_size(
+        urma_benchmark_profile::stage::urma_read_wait_completion, wait_begin, length);
     if (ec) co_return std::pair{ec, std::move(views)};
     if (completed + length > size) {
       ELOG_ERROR << "URMA read view received more data than requested: "
@@ -241,8 +244,8 @@ async_urma_read_views(urma_socket_t& socket, std::size_t size) {
       completed += view.size();
       views.push_back(std::move(view));
     }
-    urma_benchmark_profile::record_since(
-        urma_benchmark_profile::stage::urma_read_view, view_begin);
+    urma_benchmark_profile::record_since_with_size(
+        urma_benchmark_profile::stage::urma_read_view, view_begin, length);
   }
   co_return std::pair{std::error_code{}, std::move(views)};
 }
@@ -286,8 +289,8 @@ async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>> async_write(
       buffers.front() += count;
       if (buffers.front().size() == 0) buffers.erase(buffers.begin());
     }
-    urma_benchmark_profile::record_since(
-        urma_benchmark_profile::stage::urma_write_copy, copy_begin);
+    urma_benchmark_profile::record_since_with_size(
+        urma_benchmark_profile::stage::urma_write_copy, copy_begin, length);
     auto post_begin = urma_benchmark_profile::enabled()
                           ? urma_benchmark_profile::now_ns()
                           : 0;
@@ -295,8 +298,8 @@ async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>> async_write(
                      [state](std::pair<std::error_code, std::size_t> result) {
                        state->push(result);
                      });
-    urma_benchmark_profile::record_since(
-        urma_benchmark_profile::stage::urma_post_send, post_begin);
+    urma_benchmark_profile::record_since_with_size(
+        urma_benchmark_profile::stage::urma_post_send, post_begin, length);
     ++in_flight;
     return {{}, true};
   };
@@ -316,16 +319,17 @@ async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>> async_write(
                           ? urma_benchmark_profile::now_ns()
                           : 0;
     auto result = co_await detail::wait_urma_write_completion(state, socket);
-    urma_benchmark_profile::record_since(
-        urma_benchmark_profile::stage::urma_wait_send_completion, wait_begin);
+    urma_benchmark_profile::record_since_with_size(
+        urma_benchmark_profile::stage::urma_wait_send_completion,
+        wait_begin, result.second);
     --in_flight;
     if (result.first) co_return std::pair{result.first, completed};
     completed += result.second;
   }
   ELOG_DEBUG << "URMA async_write done: total_size=" << total_size
              << ", completed=" << completed;
-  urma_benchmark_profile::record_since(
-      urma_benchmark_profile::stage::urma_write_total, total_begin);
+  urma_benchmark_profile::record_since_with_size(
+      urma_benchmark_profile::stage::urma_write_total, total_begin, total_size);
   co_return std::pair{std::error_code{}, completed};
 }
 

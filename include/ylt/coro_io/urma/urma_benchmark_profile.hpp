@@ -375,16 +375,35 @@ inline void print(std::ostream& os) {
   auto has = [&](std::size_t s) { return total_counters[s] > 0; };
   auto st = [&](stage s) { return compute(static_cast<std::size_t>(s)); };
 
+  // Print bucket breakdown for a stage under the current parent
+  auto buckets = [&](int indent, stage s) {
+    for (std::size_t b = 0; b < bucket_count; ++b) {
+      auto& v = merged[static_cast<std::size_t>(s)][b];
+      if (v.empty()) continue;
+      auto bst = compute_b(static_cast<std::size_t>(s), b);
+      for (int i = 0; i < indent; ++i) os << "  ";
+      os << "  [" << bucket_names[b] << "]"
+         << " n=" << std::right << std::setw(8) << bst.sampled
+         << " avg=" << std::setw(10) << bst.avg
+         << " p50=" << std::setw(10) << bst.p50
+         << " p99=" << std::setw(10) << bst.p99
+         << " max=" << std::setw(10) << bst.max
+         << "\n";
+    }
+  };
+
   // ── Benchmark ──
   if (has(static_cast<std::size_t>(stage::benchmark_rpc_call))) {
     os << "\n[benchmark]\n";
     parent(0, true, "rpc_call (total)", st(stage::benchmark_rpc_call));
+    buckets(1, stage::benchmark_rpc_call);
   }
 
   // ── Client ──
   os << "\n[client]\n";
   if (has(static_cast<std::size_t>(stage::client_send_request))) {
     parent(0, false, "send_request", st(stage::client_send_request));
+    buckets(1, stage::client_send_request);
     if (has(static_cast<std::size_t>(stage::client_prepare_request)))
       node(1, !has(static_cast<std::size_t>(stage::urma_write_total)),
            "prepare_request", st(stage::client_prepare_request));
@@ -401,14 +420,17 @@ inline void print(std::ostream& os) {
   }
   if (has(static_cast<std::size_t>(stage::client_recv_header))) {
     parent(0, false, "recv_header", st(stage::client_recv_header));
+    buckets(1, stage::client_recv_header);
     bool has_rwc = has(static_cast<std::size_t>(stage::urma_read_wait_completion));
     bool has_rc = has(static_cast<std::size_t>(stage::urma_read_copy));
     int cnt = has_rwc + has_rc;
     if (has_rwc) node(1, --cnt == 0, "urma.read_wait", st(stage::urma_read_wait_completion));
     if (has_rc) node(1, --cnt == 0, "urma.read_copy", st(stage::urma_read_copy));
   }
-  if (has(static_cast<std::size_t>(stage::client_recv_payload)))
+  if (has(static_cast<std::size_t>(stage::client_recv_payload))) {
     parent(0, false, "recv_payload", st(stage::client_recv_payload));
+    buckets(1, stage::client_recv_payload);
+  }
   if (has(static_cast<std::size_t>(stage::client_deserialize_response)))
     parent(0, false, "deserialize_response", st(stage::client_deserialize_response));
   if (has(static_cast<std::size_t>(stage::client_connect_total))) {
@@ -425,10 +447,13 @@ inline void print(std::ostream& os) {
                     has(static_cast<std::size_t>(stage::server_dispatch));
   if (has_server) {
     os << "\n[server]\n";
-    if (has(static_cast<std::size_t>(stage::server_read_header)))
+    if (has(static_cast<std::size_t>(stage::server_read_header))) {
       parent(0, false, "read_header", st(stage::server_read_header));
+      buckets(1, stage::server_read_header);
+    }
     if (has(static_cast<std::size_t>(stage::server_read_payload))) {
       parent(0, false, "read_payload", st(stage::server_read_payload));
+      buckets(1, stage::server_read_payload);
       bool has_rwc = has(static_cast<std::size_t>(stage::urma_read_wait_completion));
       bool has_rc = has(static_cast<std::size_t>(stage::urma_read_copy));
       int cnt = has_rwc + has_rc;
@@ -437,6 +462,7 @@ inline void print(std::ostream& os) {
     }
     if (has(static_cast<std::size_t>(stage::server_dispatch))) {
       parent(0, false, "dispatch", st(stage::server_dispatch));
+      buckets(1, stage::server_dispatch);
       bool has_deser = has(static_cast<std::size_t>(stage::server_deserialize_request));
       bool has_exec = has(static_cast<std::size_t>(stage::server_handler_execute));
       bool has_sres = has(static_cast<std::size_t>(stage::server_serialize_result));

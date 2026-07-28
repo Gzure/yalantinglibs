@@ -361,7 +361,7 @@ struct urma_socket_shared_state_t
       if (!recv_result_.empty()) {
         // Overflow -> complete inline.
         auto pending = recv_result_.pop();
-        bool have_buf = pending.buffer;
+        bool have_buf = static_cast<bool>(pending.buffer);
         if (have_buf) recv_buffer_ = std::move(pending.buffer);
         lk.unlock();
         resume(std::move(pending.result), std::move(callback));
@@ -1422,13 +1422,13 @@ class urma_socket_t {
     // read back through state_->device_.
     bool want_thread_pool = conf_.event_mode && conf_.poll_threads > 0;
     if (want_thread_pool) {
-      urma_poll_thread_pool::config pcfg{
+      detail::urma_poll_thread_pool::config pcfg{
           .thread_count = conf_.poll_threads,
           .group_cq_size = conf_.group_cq_size,
           .busy_poll_budget = conf_.busy_poll_budget,
           .wait_timeout = conf_.poll_wait_timeout,
           .context = state_->device_->context()};
-      auto* pool = urma_poll_thread_pool::instance(pcfg);
+      auto* pool = detail::urma_poll_thread_pool::instance(pcfg);
       if (pool && state_->init_thread_pool(pool, conf_.group_cq_size,
                                            conf_.send_buffer_cnt)) {
         // thread_pool_mode_ is now true inside state_; state_->init will use

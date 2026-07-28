@@ -87,6 +87,13 @@ struct options_t {
   uint64_t max_memory_usage = 256ull * 1024 * 1024;
   bool profile = false;
   bool use_urma = true;
+  // URMA completion-detection mode: "threadpool" (default) uses the shared
+  // jfc poll thread pool; "event" uses the legacy per-socket event_loop;
+  // "busy" uses the legacy timer-based busy poller (event_mode off).
+  std::string poll_mode = "threadpool";
+  // Number of poll threads (= jfc groups) in threadpool mode. 0 disables the
+  // pool and falls back to the legacy event_loop.
+  uint32_t poll_threads = 4;
   uint32_t profile_sample_rate = 1;
   easylog::Severity log_level = easylog::Severity::WARNING;
 };
@@ -116,6 +123,29 @@ void configure_urma_rpc_env(const options_t& opt) {
   set_process_env("URMA_RPC_MAX_MEMORY_USAGE",
                   std::to_string(effective_pool_memory_usage(opt)));
   set_process_env("URMA_RPC_TP_TYPE", "ctp");
+
+  // Completion-detection mode selection.
+  //   threadpool -> event_mode on + poll_threads poll threads (shared jfc)
+  //   event      -> event_mode on + poll_threads=0 (legacy per-socket event_loop)
+  //   busy       -> event_mode off (legacy timer-based busy poller)
+  if (opt.poll_mode == "busy") {
+    set_process_env("URMA_RPC_EVENT_MODE", "0");
+  }
+  else {
+    set_process_env("URMA_RPC_EVENT_MODE", "1");
+    set_process_env("URMA_RPC_POLL_THREADS",
+                    opt.poll_mode == "event" ? "0"
+                                             : std::to_string(opt.poll_threads));
+  }
+  // Group CQ depth: size for ~connections/group at the per-socket queue depth,
+  // with slack.  Only used in threadpool mode.
+  auto per_socket_wr = static_cast<uint64_t>(opt.queue_depth) * 2 + 8;
+  auto group_cq_size = std::max<uint64_t>(
+      1024u, (opt.connections / std::max<uint32_t>(opt.poll_threads, 1) + 1) *
+                     per_socket_wr +
+                 64);
+  set_process_env("URMA_RPC_GROUP_CQ_SIZE", std::to_string(group_cq_size));
+  set_process_env("URMA_RPC_POLL_WAIT_TIMEOUT_MS", "100");
 }
 
 void print_usage(const char* program) {
@@ -134,6 +164,11 @@ void print_usage(const char* program) {
       << "  --queue-depth <n>        URMA send/recv queue depth. Default 64\n"
       << "  --max-memory-mib <n>     URMA buffer pool memory per process. Default 256, auto-raised when needed\n"
       << "  --no-urma               Use TCP instead of URMA RPC. Default URMA\n"
+      << "  --poll-mode <threadpool|event|busy> Completion-detection mode. Default threadpool\n"
+      << "                          threadpool: shared jfc poll thread pool (URMA_RPC_POLL_THREADS threads)\n"
+      << "                          event: legacy per-socket event_loop (URMA_RPC_POLL_THREADS=0)\n"
+      << "                          busy: legacy timer-based busy poller (URMA_RPC_EVENT_MODE=0)\n"
+      << "  --poll-threads <n>      Poll threads (= jfc groups) in threadpool mode. Default 4. 0 falls back to event\n"
       << "  --profile                Enable in-memory stage latency profiling. Default off\n"
       << "  --profile-sample-rate <n> Record one sample every n events per stage/thread. Default 1\n"
       << "  --log <trace|debug|info|warn|error> Default info\n\n"
@@ -236,6 +271,13 @@ options_t parse_options(int argc, char** argv) {
     else if (key == "--no-urma") {
       opt.use_urma = false;
     }
+    else if (key == "--poll-mode") {
+      opt.poll_mode = require_value();
+    }
+    else if (key == "--poll-threads") {
+      opt.poll_threads =
+          static_cast<uint32_t>(parse_u64(require_value(), key));
+    }
     else if (key == "--profile-sample-rate") {
       opt.profile_sample_rate =
           static_cast<uint32_t>(parse_u64(require_value(), key));
@@ -297,6 +339,11 @@ options_t parse_options(int argc, char** argv) {
   }
   if (opt.rpc != "echo" && opt.rpc != "sink" && opt.rpc != "attach_sink") {
     throw std::invalid_argument("--rpc must be echo, sink, or attach_sink");
+  }
+  if (opt.poll_mode != "threadpool" && opt.poll_mode != "event" &&
+      opt.poll_mode != "busy") {
+    throw std::invalid_argument(
+        "--poll-mode must be threadpool, event, or busy");
   }
   opt.connections = std::max<uint32_t>(opt.connections, 1);
   opt.pipeline_depth = std::max<uint32_t>(opt.pipeline_depth, 1);
@@ -756,7 +803,9 @@ int run_server(const options_t& opt) {
             << ", buffer_size=" << opt.buffer_size
             << ", queue_depth=" << opt.queue_depth
             << ", max_memory_mib="
-            << effective_pool_memory_usage(opt) / 1024 / 1024 << std::endl;
+            << effective_pool_memory_usage(opt) / 1024 / 1024
+            << ", poll_mode=" << opt.poll_mode
+            << ", poll_threads=" << opt.poll_threads << std::endl;
   if (opt.use_urma) {
     configure_urma_rpc_env(opt);
     if (!init_global_urma(opt)) return 1;
@@ -796,6 +845,8 @@ int run_client(const options_t& opt) {
             << static_cast<uint64_t>(opt.connections) * opt.pipeline_depth
             << ", concurrency=" << opt.concurrency
             << ", use_urma=" << (opt.use_urma ? "on" : "off")
+            << ", poll_mode=" << opt.poll_mode
+            << ", poll_threads=" << opt.poll_threads
             << ", profile=" << (opt.profile ? "on" : "off")
             << ", profile_sample_rate=" << opt.profile_sample_rate
             << std::endl;

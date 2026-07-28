@@ -125,6 +125,18 @@ Throughput only:
 --queue-depth <n>        URMA send/recv queue depth. Default 64
 --max-memory-mib <n>     URMA buffer pool memory per process. Default 256,
                          auto-raised when payload/connections need more
+--no-urma               Use TCP instead of URMA RPC. Default URMA.
+--poll-mode <threadpool|event|busy>
+                         Completion-detection mode. Default threadpool.
+                           threadpool: shared jfc poll thread pool
+                                       (--poll-threads threads, multiple
+                                       jetties share one jfc per group)
+                           event: legacy per-socket event_loop
+                                  (--poll-threads 0)
+                           busy: legacy timer-based busy poller
+                                 (URMA_RPC_EVENT_MODE=0)
+--poll-threads <n>       Poll threads (= jfc groups) in threadpool mode.
+                         Default 4. 0 falls back to the legacy event mode.
 --profile                Enable in-memory stage latency profiling. Default off.
 --profile-sample-rate <n> Record one sample every n events per stage/thread.
                          Default 1.

@@ -267,9 +267,17 @@ struct urma_socket_shared_state_t
     }
     urma_jfr_wr_t wr{sg, ctx, nullptr};
     urma_jfr_wr_t* bad_wr = nullptr;
+    // Push the buffer onto recv_queue_ BEFORE posting the WR.  The poll thread
+    // can drain the recv CQE as soon as urma_post_jfr_wr returns; if the buffer
+    // were not yet queued, on_recv_completion would see recv_queue_.empty(),
+    // deliver a spurious protocol_error, and leak the buffer.
+    recv_queue_.push(buffer);  // copy the SGE source addr/seg; buffer stays alive
     auto ec = make_urma_error(urma_post_jfr_wr(jfr_.get(), &wr, &bad_wr));
-    if (!ec) recv_queue_.push(std::move(buffer));
-    return ec;
+    if (ec) {
+      recv_queue_.pop();  // undo the push; caller reclaims the buffer
+      return ec;
+    }
+    return {};
   }
 
   std::error_code fill_recv_queue() {
@@ -306,16 +314,40 @@ struct urma_socket_shared_state_t
     if (thread_pool_mode_) {
       uint32_t seq = next_send_seq_.fetch_add(1, std::memory_order_relaxed);
       wr.user_ctx = encode_ctx(urma_ctx_op_send, socket_id_, seq);
+      // Register the pending send BEFORE posting the WR to hardware.  The poll
+      // thread can drain the CQE as soon as urma_post_jetty_send_wr returns; if
+      // the entry were missing, on_send_completion would drop the CQE and the
+      // send coroutine would hang forever (lost wakeup).
+      {
+        std::lock_guard lk(send_handoff_mtx_);
+        pending_send_by_seq_[seq] =
+            pending_send{buffer, length, std::move(callback)};
+      }
       auto ec =
           make_urma_error(urma_post_jetty_send_wr(jetty_.get(), &wr, &bad_wr));
       if (ec) {
-        if (buffer) device_->get_buffer_pool()->return_buffer(buffer);
-        resume({ec, 0}, std::move(callback));
+        // Post failed: remove the entry we just added and report the error.
+        // The callback is invoked inline (not via the poll thread).
+        callback_t cb;
+        urma_buffer_t buf;
+        {
+          std::lock_guard lk(send_handoff_mtx_);
+          auto it = pending_send_by_seq_.find(seq);
+          if (it != pending_send_by_seq_.end()) {
+            buf = std::move(it->second.buffer);
+            cb = std::move(it->second.callback);
+            pending_send_by_seq_.erase(it);
+          }
+        }
+        if (buf) device_->get_buffer_pool()->return_buffer(buf);
+        resume({ec, 0}, std::move(cb));
         return;
       }
-      std::lock_guard lk(send_handoff_mtx_);
-      pending_send_by_seq_[seq] =
-          pending_send{std::move(buffer), length, std::move(callback)};
+      // Ownership of buffer/callback now lives in pending_send_by_seq_ until
+      // on_send_completion pairs the CQE back.  Clear the locals so the
+      // destructors below do not touch the moved-from move_only_function.
+      buffer = {};
+      // callback was moved into the map above; nothing to clear.
       return;
     }
     // --- legacy path (unchanged) ---

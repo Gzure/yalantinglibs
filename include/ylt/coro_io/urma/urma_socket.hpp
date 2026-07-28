@@ -366,43 +366,49 @@ struct urma_socket_shared_state_t
 
   void async_receive(callback_t&& callback) {
     if (thread_pool_mode_) {
-      // Thread-pool recv path.  Take the OLDEST unconsumed result first to
-      // preserve FIFO byte-stream order.  on_recv_completion fills the single
-      // slot (recv_pending_cr_) when it is free, and only overflows into
-      // recv_result_ when the slot is already occupied by an unconsumed result,
-      // so the slot always holds the oldest result and recv_result_ holds later
-      // ones in FIFO order.  Drain order under the lock:
+      // Thread-pool recv path.  Spin briefly (like wait_urma_write_completion)
+      // to catch a result that the poll thread has already handed off, avoiding
+      // the ~100us+ asio::post scheduler hop when we suspend and get resumed
+      // via finish_recv_handoff.  Drain order (FIFO):
       //   1. recv_pending_cr_ set   -> take the slot inline (oldest).
       //   2. recv_result_ non-empty -> pop and complete inline (later overflow).
-      //   3. otherwise              -> store recv_pending_callback_ (waiter).
-      // unique_lock so we can unlock before invoking the callback.
-      std::unique_lock lk(recv_handoff_mtx_);
-      if (recv_pending_cr_) {
-        // Slot -> complete inline.
-        auto cr = *recv_pending_cr_;
-        recv_pending_cr_.reset();
-        bool have_buf = recv_pending_buffer_valid_;
-        recv_pending_buffer_valid_ = false;
-        if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
-        lk.unlock();
-        std::error_code ec = cr.status
-            ? std::make_error_code(std::errc::io_error)
-            : std::error_code{};
-        resume({ec, cr.completion_len}, std::move(callback));
-        return;
+      //   3. otherwise              -> spin a few times, then store callback.
+      auto try_take = [&]() -> bool {
+        std::unique_lock lk(recv_handoff_mtx_);
+        if (recv_pending_cr_) {
+          auto cr = *recv_pending_cr_;
+          recv_pending_cr_.reset();
+          bool have_buf = recv_pending_buffer_valid_;
+          recv_pending_buffer_valid_ = false;
+          if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
+          lk.unlock();
+          std::error_code ec = cr.status
+              ? std::make_error_code(std::errc::io_error)
+              : std::error_code{};
+          resume({ec, cr.completion_len}, std::move(callback));
+          return true;
+        }
+        if (!recv_result_.empty()) {
+          auto pending = recv_result_.pop();
+          bool have_buf = static_cast<bool>(pending.buffer);
+          if (have_buf) recv_buffer_ = std::move(pending.buffer);
+          lk.unlock();
+          resume(std::move(pending.result), std::move(callback));
+          return true;
+        }
+        return false;
+      };
+      // Fast path: result may already be available (poll thread drained the
+      // CQE while we were between calls).  32 yield-spins cover the typical
+      // 1-10us CQE-arrival window.
+      for (int i = 0; i < 32; ++i) {
+        if (try_take()) return;
+        std::this_thread::yield();
       }
-      if (!recv_result_.empty()) {
-        // Overflow -> complete inline.
-        auto pending = recv_result_.pop();
-        bool have_buf = static_cast<bool>(pending.buffer);
-        if (have_buf) recv_buffer_ = std::move(pending.buffer);
-        lk.unlock();
-        resume(std::move(pending.result), std::move(callback));
-        return;
-      }
-      // Nothing ready: register as the waiter.  The poll thread's
-      // on_recv_completion will fill recv_pending_cr_ and resume the
-      // callback directly (no asio::post hop).
+      // Still nothing: register as the waiter.  The poll thread's
+      // on_recv_completion will fill recv_pending_cr_ and post
+      // finish_recv_handoff to resume us.
+      std::lock_guard lk(recv_handoff_mtx_);
       recv_pending_callback_ = std::move(callback);
       return;
     }
@@ -464,20 +470,11 @@ struct urma_socket_shared_state_t
     }
     handoff_cr cr{0, static_cast<uint32_t>(ec.value()),
                   static_cast<uint32_t>(completion_len), 1};
-    // When a recv coroutine is waiting, complete it directly on this thread
-    // (the poll thread) instead of resuming the callback directly on the
-    // request-thread executor.  This matches the send path (push() fires the
-    // resume handler directly) and avoids the ~100us+ scheduler hop that
-    // asio::post adds.  The resumed coroutine runs briefly on the poll thread
-    // until it hits its next suspend point, just like the send path.
-    callback_t cb;
-    bool have_buf = false;
+    bool has_waiter = false;
     {
       std::lock_guard lk(recv_handoff_mtx_);
       if (recv_queue_.empty()) {
-        // protocol error: deliver an error result (no buffer).  Only fill the
-        // slot if it is free; otherwise drop into overflow so a pending waiter
-        // still observes the error via on_recv_completion/async_receive.
+        // protocol error: deliver an error result (no buffer).
         if (!recv_pending_cr_) {
           recv_pending_cr_ =
               handoff_cr{0, uint32_t(std::errc::protocol_error), 0, 1};
@@ -494,13 +491,10 @@ struct urma_socket_shared_state_t
           ELOG_ERROR << "URMA refill recv queue failed: " << refill_ec.message();
         }
         if (!recv_pending_cr_) {
-          // Slot free: hand this result off directly.
           recv_pending_buffer_ = std::move(completed_buffer);
           recv_pending_buffer_valid_ = true;
           recv_pending_cr_ = cr;
         } else {
-          // Slot occupied by an unconsumed result (a previous completion that no
-          // coroutine has taken yet): overflow this one into recv_result_.
           if (recv_result_.full()) {
             ELOG_ERROR << "URMA recv result queue is full; cannot cache "
                           "completed recv buffer";
@@ -511,24 +505,40 @@ struct urma_socket_shared_state_t
           }
         }
       }
-      // If a recv coroutine is waiting, take its callback and the result now
-      // so we can resume it directly after unlocking.
-      if (recv_pending_callback_ && recv_pending_cr_) {
-        cb = std::move(recv_pending_callback_);
-        recv_pending_callback_ = nullptr;
-        cr = *recv_pending_cr_;
-        recv_pending_cr_.reset();
-        have_buf = recv_pending_buffer_valid_;
-        recv_pending_buffer_valid_ = false;
-      }
+      has_waiter = static_cast<bool>(recv_pending_callback_);
     }
-    if (cb) {
-      if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
-      std::error_code recv_ec = cr.status
-          ? std::make_error_code(std::errc::io_error)
-          : std::error_code{};
-      resume({recv_ec, cr.completion_len}, std::move(cb));
+    // Resume the recv coroutine via asio::post on the request-thread executor.
+    // We must NOT resume directly on the poll thread: doing so blocks the poll
+    // thread while the coroutine executes, serializing CQE drainage for all
+    // sockets in the group and inflating latency for everyone.
+    if (has_waiter) {
+      auto self = shared_from_this();
+      asio::post(executor_->get_asio_executor(),
+                 [self] { self->finish_recv_handoff(); });
     }
+  }
+
+  // Runs on the request thread (posted by on_recv_completion) to finish a
+  // recv that was handed off by the poll thread.
+  void finish_recv_handoff() {
+    handoff_cr cr{};
+    bool have_buf = false;
+    callback_t cb;
+    {
+      std::lock_guard lk(recv_handoff_mtx_);
+      if (!recv_pending_cr_) return;
+      cr = *recv_pending_cr_;
+      recv_pending_cr_.reset();
+      have_buf = recv_pending_buffer_valid_;
+      recv_pending_buffer_valid_ = false;
+      cb = std::move(recv_pending_callback_);
+      recv_pending_callback_ = nullptr;
+    }
+    if (have_buf) recv_buffer_ = std::move(recv_pending_buffer_);
+    std::error_code ec = cr.status
+        ? std::make_error_code(std::errc::io_error)
+        : std::error_code{};
+    resume({ec, cr.completion_len}, std::move(cb));
   }
 
   // Called from the poll thread when a CQE indicates a transport error

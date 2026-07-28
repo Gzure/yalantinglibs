@@ -270,8 +270,9 @@ struct urma_socket_shared_state_t
     // Push the buffer onto recv_queue_ BEFORE posting the WR.  The poll thread
     // can drain the recv CQE as soon as urma_post_jfr_wr returns; if the buffer
     // were not yet queued, on_recv_completion would see recv_queue_.empty(),
-    // deliver a spurious protocol_error, and leak the buffer.
-    recv_queue_.push(buffer);  // copy the SGE source addr/seg; buffer stays alive
+    // deliver a spurious protocol_error, and leak the buffer.  sge already
+    // captured buffer.addr/seg above, so moving buffer here is safe.
+    recv_queue_.push(std::move(buffer));
     auto ec = make_urma_error(urma_post_jfr_wr(jfr_.get(), &wr, &bad_wr));
     if (ec) {
       recv_queue_.pop();  // undo the push; caller reclaims the buffer

@@ -366,18 +366,14 @@ struct urma_socket_shared_state_t
 
   void async_receive(callback_t&& callback) {
     if (thread_pool_mode_) {
-      // Spin-then-suspend recv handoff (mirrors wait_urma_write_completion).
-      //
-      // Fast path: spin on recv_seq_ for 64 iterations.  In latency mode
-      // (serial, one connection) the CQE arrives in 1-10us and the spin
-      // catches it with zero scheduler overhead.  yield() lets other
-      // coroutines on the same thread run between checks.
-      //
-      // Slow path: if the result hasn't arrived, store the callback and
-      // suspend.  on_recv_completion will asio::post the callback to the
-      // executor (NOT run it on the poll thread, which must stay free).
+      // No spin.  Check overflow first, then the atomic slot; if nothing is
+      // ready, store the callback and suspend.  on_recv_completion (poll
+      // thread) will call resume() directly on the poll thread when the result
+      // arrives.  The resumed coroutine runs briefly (memcpy + loop back to
+      // the next co_await async_io, which calls post_recv then suspends) -
+      // no spin, no asio::post.
 
-      // First check overflow (a previous result that didn't fit the slot).
+      // Check overflow.
       {
         std::lock_guard lk(recv_overflow_mtx_);
         if (!recv_result_.empty()) {
@@ -387,22 +383,22 @@ struct urma_socket_shared_state_t
           return;
         }
       }
-      // Spin on the atomic slot.
+      // Check the atomic slot: a result may already be there from a previous
+      // on_recv_completion that arrived while we were between calls.
       uint64_t expected =
           recv_consumed_seq_.load(std::memory_order_acquire);
-      for (int i = 0; i < 64; ++i) {
-        if (recv_seq_.load(std::memory_order_acquire) != expected) {
-          // Result is ready: take it.
-          recv_buffer_ = recv_completed_buffer_;
-          recv_consumed_seq_.store(
-              recv_seq_.load(std::memory_order_relaxed),
-              std::memory_order_release);
-          resume(recv_result_atomic_, std::move(callback));
-          return;
-        }
-        std::this_thread::yield();
+      if (recv_seq_.load(std::memory_order_acquire) != expected) {
+        // Result already ready: take it inline (no suspend, no poll-thread
+        // involvement - this is the "result arrived before we asked" case).
+        recv_buffer_ = recv_completed_buffer_;
+        recv_consumed_seq_.store(
+            recv_seq_.load(std::memory_order_relaxed),
+            std::memory_order_release);
+        resume(recv_result_atomic_, std::move(callback));
+        return;
       }
-      // Slow path: store the callback.  on_recv_completion will asio::post it.
+      // Nothing ready: store the callback.  on_recv_completion will resume()
+      // it directly on the poll thread when the recv CQE arrives.
       recv_pending_callback_ = std::move(callback);
       return;
     }
@@ -486,38 +482,25 @@ struct urma_socket_shared_state_t
     post_recv_callback_if_pending();
   }
 
-  // If the recv coroutine suspended (slow path), take its callback and asio::post
-  // it to the executor so the coroutine resumes on its own thread (not the poll
-  // thread).  The callback will re-check the atomic slot and consume the result.
+  // If the recv coroutine suspended, take its callback and resume() directly
+  // on the poll thread (no asio::post).  The callback is the async_io
+  // handler.set_value_then_resume closure; calling it resumes the coroutine
+  // on the poll thread.  The coroutine runs briefly (memcpy + loop back to
+  // the next co_await, which calls post_recv then suspends) - no spin, so
+  // the poll thread is blocked for only a few microseconds.
   void post_recv_callback_if_pending() {
     callback_t cb;
-    {
-      // No lock needed: recv_pending_callback_ is written by the request thread
-      // (async_receive slow path) and read here (poll thread).  The request
-      // thread sets it BEFORE the spin budget expires, and the poll thread reads
-      // it AFTER writing the atomic result.  A missed read just means the
-      // coroutine will pick up the result on its next spin iteration (it hasn't
-      // suspended yet).  A spurious read (callback set but result not yet
-      // written) is impossible because this is called AFTER recv_seq_ is bumped.
-      cb = std::move(recv_pending_callback_);
-      recv_pending_callback_ = nullptr;
-    }
+    cb = std::move(recv_pending_callback_);
+    recv_pending_callback_ = nullptr;
     if (cb) {
-      auto self = shared_from_this();
-      asio::post(executor_->get_asio_executor(), [self, cb = std::move(cb)]() mutable {
-        // The callback expects a (ec, length) pair; read it from the atomic slot.
-        // The coroutine's async_io wrapper will call this callback, which does
-        // handler.set_value_then_resume - but we need to pass the result.
-        // Actually, the callback IS the handler.set_value_then_resume closure.
-        // We need to invoke it with the result.  But the callback signature is
-        // callback_t = move_only_function<void(std::pair<ec, size_t>)>.
-        // Read the result from the atomic slot.
-        self->recv_consumed_seq_.store(
-            self->recv_seq_.load(std::memory_order_relaxed),
-            std::memory_order_release);
-        self->recv_buffer_ = self->recv_completed_buffer_;
-        cb(self->recv_result_atomic_);
-      });
+      // Mark the slot as consumed and set recv_buffer_ before resuming.
+      recv_consumed_seq_.store(
+          recv_seq_.load(std::memory_order_relaxed),
+          std::memory_order_release);
+      recv_buffer_ = recv_completed_buffer_;
+      // resume() calls cb({ec, len}) which does handler.set_value_then_resume.
+      // The coroutine resumes on THIS (poll) thread.
+      resume(recv_result_atomic_, std::move(cb));
     }
   }
 
@@ -825,26 +808,18 @@ struct urma_socket_shared_state_t
         }
       }
       wake_writer(ec);
-      // Pending recv: bump recv_seq_ with an error so a spinning coroutine
-      // exits.  Also wake a suspended coroutine (slow path) via asio::post.
-      // Drain overflow buffers.
+      // Pending recv: resume a suspended coroutine with the error directly.
+      // fail_pending runs on the executor thread (via close()), so resume()
+      // is safe here.  Drain overflow buffers.
       {
-        recv_result_atomic_ = {ec, 0};
-        recv_completed_buffer_ = {};
-        recv_seq_.fetch_add(1, std::memory_order_release);
-        // Wake a suspended recv coroutine if any.
         if (recv_pending_callback_) {
           callback_t cb = std::move(recv_pending_callback_);
           recv_pending_callback_ = nullptr;
-          auto self = shared_from_this();
-          asio::post(executor_->get_asio_executor(),
-                     [self, cb = std::move(cb), ec]() mutable {
-                       self->recv_buffer_ = {};
-                       self->recv_consumed_seq_.store(
-                           self->recv_seq_.load(std::memory_order_relaxed),
-                           std::memory_order_release);
-                       cb({ec, 0});
-                     });
+          recv_buffer_ = {};
+          recv_consumed_seq_.store(
+              recv_seq_.load(std::memory_order_relaxed),
+              std::memory_order_release);
+          resume({ec, 0}, std::move(cb));
         }
         std::lock_guard lk(recv_overflow_mtx_);
         while (!recv_result_.empty()) {

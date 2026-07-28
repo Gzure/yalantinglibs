@@ -21,7 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -43,30 +42,27 @@ void make_urma_buffers(std::vector<AsioBuffer>& result,
 }
 
 struct urma_write_completion_state {
-  // Lock-free single-slot result with a spin-then-suspend fallback.
-  // seq_ is bumped (release) by push() when a result is placed in result_.
-  // The request thread first spins on seq_ (acquire) for a short budget
-  // (fast path, ~1-10us, no scheduler hop); if the result hasn't arrived
-  // it falls back to suspend + asio::post resume (slow path, for throughput
-  // mode where many connections share executor threads and spinning would
-  // starve other coroutines).
+  // Single-slot result.  push() (poll thread) writes the result and fires
+  // resume_handler directly via handler.resume() on the poll thread.  The
+  // resumed coroutine runs briefly (returns to async_write's loop, posts the
+  // next send, then co_await suspends again) - no spin, no asio::post.
+  // seq_ tracks whether a result is pending (push bumps it; the coroutine
+  // reads it to detect "result already arrived" without spinning).
   std::atomic<uint64_t> seq_{0};
   std::pair<std::error_code, std::size_t> result;
   std::mutex mtx;
   async_simple::util::move_only_function<void()> resume_handler;
 
-  // Called by the poll thread (via the post_send callback).
   void push(std::pair<std::error_code, std::size_t> r) {
     result = r;
-    seq_.fetch_add(1, std::memory_order_release);  // publish result (spin path)
-    // Also fire the resume handler if the coroutine suspended (slow path).
+    uint64_t s = seq_.fetch_add(1, std::memory_order_release) + 1;
     async_simple::util::move_only_function<void()> h;
     {
       std::lock_guard lk(mtx);
       h = std::move(resume_handler);
       resume_handler = nullptr;
     }
-    if (h) h();
+    if (h) h();  // resume the coroutine directly on the poll thread
   }
 };
 
@@ -75,41 +71,32 @@ wait_urma_write_completion(
     const std::shared_ptr<urma_write_completion_state>& state,
     urma_socket_t& socket) {
   (void)socket;
-  // Fast path: spin on the atomic for up to 64 iterations.  In latency mode
-  // (serial, one connection) the CQE arrives in 1-10us and the spin catches
-  // it with zero scheduler overhead.  yield() lets other coroutines on the
-  // same thread run between checks.
-  uint64_t expected = state->seq_.load(std::memory_order_acquire);
-  for (int i = 0; i < 64; ++i) {
-    if (state->seq_.load(std::memory_order_acquire) != expected) {
-      co_return state->result;
-    }
-    std::this_thread::yield();
-  }
-  // Slow path: the result hasn't arrived within the spin budget.  Suspend and
-  // let the poll thread resume us via push() -> resume_handler.  This avoids
-  // burning CPU in throughput mode where many connections share the executor.
-  while (true) {
-    {
-      std::lock_guard lk(state->mtx);
-      // Re-check under the lock: the result may have arrived between the last
-      // spin and here.
-      if (state->seq_.load(std::memory_order_acquire) != expected) {
-        co_return state->result;
-      }
-      // Install the resume handler; push() will fire it.
-    }
-    callback_awaitor<void> awaitor;
-    co_await awaitor.await_resume([&state](auto handler) {
-      std::lock_guard lk(state->mtx);
+  // No spin.  Suspend immediately; push() (poll thread) resumes us directly
+  // via handler.resume().  The coroutine runs briefly on the poll thread
+  // after resume (just enough to loop back and post the next send / suspend),
+  // then the poll thread is free again.
+  //
+  // Lost-wakeup handling: the setup lambda runs inside await_suspend (before
+  // the coroutine formally suspends).  Under the lock it checks seq_ - if the
+  // result already arrived (push ran before the lock), it does NOT install a
+  // handler; instead it posts a self-resume via asio::post (the rare case).
+  // If the result hasn't arrived, it installs resume_handler; push() will fire
+  // it when the result arrives.
+  uint64_t before = state->seq_.load(std::memory_order_acquire);
+  callback_awaitor<void> awaitor;
+  co_await awaitor.await_resume([&state, &socket, before](auto handler) {
+    std::lock_guard lk(state->mtx);
+    if (state->seq_.load(std::memory_order_acquire) != before) {
+      // Result already arrived.  Cannot call handler.resume() inside
+      // await_suspend (UB).  Post a self-resume; the coroutine will read
+      // state->result on resume.
+      asio::post(socket.get_executor(),
+                 [handler]() mutable { handler.resume(); });
+    } else {
       state->resume_handler = [handler]() mutable { handler.resume(); };
-    });
-    // Resumed by push().  Re-check.
-    if (state->seq_.load(std::memory_order_acquire) != expected) {
-      co_return state->result;
     }
-    // Spurious resume: loop and re-suspend.
-  }
+  });
+  co_return state->result;
 }
 
 template <typename Buffer>

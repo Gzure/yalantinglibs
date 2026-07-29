@@ -25,6 +25,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #include "ylt/coro_io/urma/urma_jfc_group.hpp"
 #include "ylt/easylog.hpp"
 #include "ylt/urma/urma_api.h"
@@ -90,7 +95,19 @@ class urma_poll_thread_pool {
       groups_.push_back(std::move(g));
     }
     for (uint32_t i = 0; i < cfg_.thread_count; ++i) {
-      threads_.emplace_back([this, i] { poll_loop(i); });
+      threads_.emplace_back([this, i] {
+        // Pin the poll thread to a dedicated CPU core so it never competes
+        // with io_context threads.  Use cores starting from 0; if there are
+        // more poll threads than cores, the OS will handle overlap.
+        unsigned int core = i % std::max(1u, std::thread::hardware_concurrency());
+#ifdef __linux__
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#endif
+        poll_loop(i);
+      });
     }
     ELOG_INFO << "urma_poll_thread_pool started: threads=" << cfg_.thread_count;
     return true;

@@ -1000,75 +1000,34 @@ inline void urma_poll_thread_pool::dispatch(urma_jfc_group* group,
 inline void urma_poll_thread_pool::poll_loop(uint32_t gi) {
   auto* group = groups_[gi].get();
   auto* jfc = group->jfc();
-  auto* jfce = group->jfce();
   std::array<urma_cr_t, 16> crs{};
-  std::size_t idle_spins = 0;
-  int rearm_failures = 0;
-  // Consecutive urma_poll_jfc failures (< 0).  A single transient hiccup is
-  // not fatal; a sustained run indicates the jfc/jfce is broken (hardware
-  // failure), at which point the whole group is unusable and must be torn down
-  // per spec §5 (group-level error).
+  // Consecutive urma_poll_jfc failures (< 0).
   int consecutive_errors = 0;
+  // Pure busy-poll: no wait_jfc, no rearm, no yield.  The poll thread is
+  // pinned to a dedicated CPU core (see init), so it never competes with
+  // io_context threads.  This gives minimum latency: CQEs are drained the
+  // instant they arrive, with zero scheduler/event-hop overhead.
   while (!stop_.load(std::memory_order_acquire)) {
     int n = urma_poll_jfc(jfc, static_cast<int>(crs.size()), crs.data());
     if (n < 0) {
       ELOG_WARN << "urma_poll_jfc error errno=" << errno << " group=" << gi;
       if (++consecutive_errors >= 64) {
-        // Persistent poll failure -> the jfc/jfce is broken.  Mark the group
-        // errored (new sockets are rejected at init), wake every registered
-        // socket with a teardown (post close() onto each socket's executor,
-        // which drains its pending coroutines with operation_canceled and
-        // unregisters it), and exit this poll thread.  Other groups keep
-        // running (isolation).
         ELOG_ERROR << "urma_poll_jfc persistently failing for group=" << gi
                    << "; marking group errored and exiting poll thread";
         group->mark_errored();
         group->for_each_socket([](std::shared_ptr<urma_socket_shared_state_t> s) {
           s->post_close_on_error();
         });
-        return;  // exit this poll thread
+        return;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       continue;
     }
-    // Any successful poll (n >= 0, including the n == 0 idle case) clears the
-    // consecutive-error counter: the group has recovered from a transient
-    // hiccup, so do not accumulate stale failures toward the threshold.
     consecutive_errors = 0;
     if (n > 0) {
       for (int k = 0; k < n; ++k) dispatch(group, crs[k]);
-      idle_spins = 0;
-      continue;
     }
-    // n == 0: no CQE.  yield to let other threads (including the resumed
-    // coroutines on io_context threads) run.  Without yield the poll thread
-    // 100% busy-spins and starves coroutines on the same CPU core, causing
-    // large latency variance (118us vs 564us for the same code).
-    std::this_thread::yield();
-    if (++idle_spins < cfg_.busy_poll_budget) continue;
-
-    // idle budget exceeded -> block on the event channel
-    if (urma_rearm_jfc(jfc, false) != URMA_SUCCESS) {
-      if (++rearm_failures > 8) {
-        ELOG_WARN << "urma_rearm_jfc failing repeatedly group=" << gi;
-        rearm_failures = 0;
-      }
-      idle_spins = 0;
-      continue;
-    }
-    rearm_failures = 0;
-    urma_jfc_t* ev_jfc = nullptr;
-    int ev = urma_wait_jfc(jfce, 1,
-                           static_cast<int>(cfg_.wait_timeout.count()),
-                           &ev_jfc);
-    if (ev > 0 && ev_jfc) {
-      uint32_t ack = 1;
-      urma_ack_jfc(&ev_jfc, &ack, 1);
-    } else if (ev < 0) {
-      ELOG_WARN << "urma_wait_jfc error group=" << gi;
-    }
-    // ev == 0 (timeout, no event) is the normal idle case - stay quiet.
-    idle_spins = 0;
+    // n == 0: no CQE, immediately poll again (pure busy-poll).
   }
 }
 

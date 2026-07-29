@@ -385,8 +385,7 @@ struct urma_socket_shared_state_t
       uint64_t expected =
           recv_consumed_seq_.load(std::memory_order_acquire);
       if (recv_seq_.load(std::memory_order_acquire) != expected) {
-        recv_buffer_ = std::move(recv_completed_buffer_);
-        recv_completed_buffer_ = {};
+        recv_buffer_ = recv_completed_buffer_;
         recv_consumed_seq_.store(
             recv_seq_.load(std::memory_order_relaxed),
             std::memory_order_release);
@@ -446,7 +445,7 @@ struct urma_socket_shared_state_t
     }
     callback_t cb;  // extracted under lock if a waiter is present
     {
-      std::unique_lock lk(recv_handoff_mtx_);
+      std::lock_guard lk(recv_handoff_mtx_);
       if (recv_queue_.empty()) {
         recv_result_atomic_ = {std::make_error_code(std::errc::protocol_error), 0};
         recv_completed_buffer_ = {};
@@ -490,8 +489,7 @@ struct urma_socket_shared_state_t
         recv_consumed_seq_.store(
             recv_seq_.load(std::memory_order_relaxed),
             std::memory_order_release);
-        recv_buffer_ = std::move(recv_completed_buffer_);
-        recv_completed_buffer_ = {};
+        recv_buffer_ = recv_completed_buffer_;
       }
     }
     // Refill recv queue outside the lock (hardware post, may be slow).
@@ -1042,6 +1040,11 @@ inline void urma_poll_thread_pool::poll_loop(uint32_t gi) {
       idle_spins = 0;
       continue;
     }
+    // n == 0: no CQE.  yield to let other threads (including the resumed
+    // coroutines on io_context threads) run.  Without yield the poll thread
+    // 100% busy-spins and starves coroutines on the same CPU core, causing
+    // large latency variance (118us vs 564us for the same code).
+    std::this_thread::yield();
     if (++idle_spins < cfg_.busy_poll_budget) continue;
 
     // idle budget exceeded -> block on the event channel

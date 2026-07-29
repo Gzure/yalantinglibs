@@ -96,11 +96,6 @@ wait_urma_write_completion(
       state->resume_handler = [handler]() mutable { handler.resume(); };
     }
   });
-  // Resumed by push() (poll thread).  Immediately dispatch back to the
-  // executor thread so the coroutine's subsequent work (post_send which calls
-  // urma_post_jetty_send_wr) does NOT run on the poll thread.  The poll thread
-  // only spends the asio::post enqueue time (~1us), then is free to poll again.
-  co_await dispatch(socket.get_executor());
   // Consume the result.
   std::pair<std::error_code, std::size_t> r;
   {
@@ -137,10 +132,6 @@ async_urma_read(urma_socket_t& socket, Buffer&& raw_buffer, bool read_some) {
                 socket.post_recv(std::move(callback));
               },
               socket);
-      // The recv coroutine was resumed by on_recv_completion on the poll
-      // thread.  Dispatch back to the executor thread so the subsequent work
-      // (memcpy, loop, post_recv) does NOT run on the poll thread.
-      co_await dispatch(socket.get_executor());
       urma_benchmark_profile::record_since_with_size(
           urma_benchmark_profile::stage::urma_read_wait_completion,
           wait_begin, length);

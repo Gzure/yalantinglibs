@@ -42,23 +42,24 @@ void make_urma_buffers(std::vector<AsioBuffer>& result,
 }
 
 struct urma_write_completion_state {
-  // Single-slot result.  push() (poll thread) writes the result and fires
-  // resume_handler directly via handler.resume() on the poll thread.  The
-  // resumed coroutine runs briefly (returns to async_write's loop, posts the
-  // next send, then co_await suspends again) - no spin, no asio::post.
-  // seq_ tracks whether a result is pending (push bumps it; the coroutine
-  // reads it to detect "result already arrived" without spinning).
+  // Single-slot result.  push() (poll thread) writes the result, bumps seq_,
+  // and fires resume_handler directly via handler.resume() on the poll thread.
+  // seq_ and result are written under mtx; resume_handler is also under mtx.
+  // This makes "is a result pending?" and "is a waiter registered?" atomic
+  // together - no lost wakeup.
   std::atomic<uint64_t> seq_{0};
   std::pair<std::error_code, std::size_t> result;
+  bool has_result_ = false;  // protected by mtx; true after push() until consumed
   std::mutex mtx;
   async_simple::util::move_only_function<void()> resume_handler;
 
   void push(std::pair<std::error_code, std::size_t> r) {
-    result = r;
-    uint64_t s = seq_.fetch_add(1, std::memory_order_release) + 1;
     async_simple::util::move_only_function<void()> h;
     {
       std::lock_guard lk(mtx);
+      result = r;
+      has_result_ = true;
+      seq_.fetch_add(1, std::memory_order_release);
       h = std::move(resume_handler);
       resume_handler = nullptr;
     }
@@ -71,32 +72,38 @@ wait_urma_write_completion(
     const std::shared_ptr<urma_write_completion_state>& state,
     urma_socket_t& socket) {
   (void)socket;
-  // No spin.  Suspend immediately; push() (poll thread) resumes us directly
-  // via handler.resume().  The coroutine runs briefly on the poll thread
-  // after resume (just enough to loop back and post the next send / suspend),
-  // then the poll thread is free again.
+  // No spin.  Suspend; push() (poll thread) resumes us directly via
+  // handler.resume().  The coroutine runs briefly on the poll thread
+  // after resume, then the poll thread is free again.
   //
   // Lost-wakeup handling: the setup lambda runs inside await_suspend (before
-  // the coroutine formally suspends).  Under the lock it checks seq_ - if the
-  // result already arrived (push ran before the lock), it does NOT install a
-  // handler; instead it posts a self-resume via asio::post (the rare case).
-  // If the result hasn't arrived, it installs resume_handler; push() will fire
-  // it when the result arrives.
-  uint64_t before = state->seq_.load(std::memory_order_acquire);
+  // the coroutine formally suspends).  Under the lock it checks has_result_ -
+  // if the result already arrived (push ran before the lock), it does NOT
+  // install a handler; instead it posts a self-resume via asio::post (rare).
+  // If no result yet, it installs resume_handler; push() will fire it.
+  // Both the check and the install are under the SAME lock that push() uses,
+  // so there is no window where push() can slip in between them.
   callback_awaitor<void> awaitor;
-  co_await awaitor.await_resume([&state, &socket, before](auto handler) {
+  co_await awaitor.await_resume([&state, &socket](auto handler) {
     std::lock_guard lk(state->mtx);
-    if (state->seq_.load(std::memory_order_acquire) != before) {
+    if (state->has_result_) {
       // Result already arrived.  Cannot call handler.resume() inside
-      // await_suspend (UB).  Post a self-resume; the coroutine will read
-      // state->result on resume.
+      // await_suspend (UB: frame destroyed under await_suspend).  Post a
+      // self-resume; the coroutine will read state->result on resume.
       asio::post(socket.get_executor(),
                  [handler]() mutable { handler.resume(); });
     } else {
       state->resume_handler = [handler]() mutable { handler.resume(); };
     }
   });
-  co_return state->result;
+  // Consume the result.
+  std::pair<std::error_code, std::size_t> r;
+  {
+    std::lock_guard lk(state->mtx);
+    r = state->result;
+    state->has_result_ = false;
+  }
+  co_return r;
 }
 
 template <typename Buffer>

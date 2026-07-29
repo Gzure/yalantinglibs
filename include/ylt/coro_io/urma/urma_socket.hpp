@@ -492,15 +492,17 @@ struct urma_socket_shared_state_t
         recv_buffer_ = recv_completed_buffer_;
       }
     }
-    // Refill recv queue outside the lock (hardware post, may be slow).
+    // Resume the coroutine FIRST (fast: just writes result + handler.resume).
+    // The coroutine runs briefly on the poll thread (memcpy + loop to next
+    // co_await suspend).  fill_recv_queue (hardware post) is deferred to after
+    // resume so it doesn't delay the coroutine's resume or the next CQE drain.
+    if (cb) {
+      resume(recv_result_atomic_, std::move(cb));
+    }
+    // Refill recv queue after resume (hardware post, may be slow).
     auto refill_ec = fill_recv_queue();
     if (refill_ec) {
       ELOG_ERROR << "URMA refill recv queue failed: " << refill_ec.message();
-    }
-    // Resume the coroutine directly on the poll thread (no asio::post).
-    // The coroutine runs briefly (memcpy + loop to next co_await suspend).
-    if (cb) {
-      resume(recv_result_atomic_, std::move(cb));
     }
   }
 

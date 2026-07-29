@@ -445,7 +445,7 @@ struct urma_socket_shared_state_t
     }
     callback_t cb;  // extracted under lock if a waiter is present
     {
-      std::lock_guard lk(recv_handoff_mtx_);
+      std::unique_lock lk(recv_handoff_mtx_);
       if (recv_queue_.empty()) {
         recv_result_atomic_ = {std::make_error_code(std::errc::protocol_error), 0};
         recv_completed_buffer_ = {};

@@ -366,13 +366,23 @@ struct urma_socket_shared_state_t
 
   void async_receive(callback_t&& callback) {
     if (thread_pool_mode_) {
-      // No spin.  Under recv_handoff_mtx_: check overflow, then the slot; if
-      // nothing is ready, store the callback and suspend.  on_recv_completion
-      // takes the SAME lock when writing the result and reading the callback,
-      // so there is no window where it can slip in between our check and our
-      // callback store (no lost wakeup).
+      // Phase 1: short busy-spin on recv_seq_ (pure atomic, no mutex, no
+      // yield).  Catches the result without poll-thread involvement.
+      uint64_t expected =
+          recv_consumed_seq_.load(std::memory_order_acquire);
+      for (int i = 0; i < 8; ++i) {
+        if (recv_seq_.load(std::memory_order_acquire) != expected) {
+          recv_buffer_ = std::move(recv_completed_buffer_);
+          recv_completed_buffer_ = {};
+          recv_consumed_seq_.store(
+              recv_seq_.load(std::memory_order_relaxed),
+              std::memory_order_release);
+          resume(recv_result_atomic_, std::move(callback));
+          return;
+        }
+      }
+      // Phase 2: spin missed.  Check under lock, then store callback.
       std::unique_lock lk(recv_handoff_mtx_);
-      // Check overflow.
       if (!recv_result_.empty()) {
         auto pending = recv_result_.pop();
         if (pending.buffer) recv_buffer_ = std::move(pending.buffer);
@@ -380,12 +390,10 @@ struct urma_socket_shared_state_t
         resume(std::move(pending.result), std::move(callback));
         return;
       }
-      // Check the atomic slot: a result may already be there from a previous
-      // on_recv_completion.
-      uint64_t expected =
-          recv_consumed_seq_.load(std::memory_order_acquire);
+      expected = recv_consumed_seq_.load(std::memory_order_acquire);
       if (recv_seq_.load(std::memory_order_acquire) != expected) {
-        recv_buffer_ = recv_completed_buffer_;
+        recv_buffer_ = std::move(recv_completed_buffer_);
+        recv_completed_buffer_ = {};
         recv_consumed_seq_.store(
             recv_seq_.load(std::memory_order_relaxed),
             std::memory_order_release);
@@ -393,7 +401,6 @@ struct urma_socket_shared_state_t
         resume(recv_result_atomic_, std::move(callback));
         return;
       }
-      // Nothing ready: store the callback (still under the lock).
       recv_pending_callback_ = std::move(callback);
       return;
     }
@@ -489,7 +496,8 @@ struct urma_socket_shared_state_t
         recv_consumed_seq_.store(
             recv_seq_.load(std::memory_order_relaxed),
             std::memory_order_release);
-        recv_buffer_ = recv_completed_buffer_;
+        recv_buffer_ = std::move(recv_completed_buffer_);
+        recv_completed_buffer_ = {};
       }
     }
     // Resume the coroutine FIRST (fast: just writes result + handler.resume).

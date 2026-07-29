@@ -213,13 +213,27 @@ async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>> async_write(
   ELOG_DEBUG << "URMA async_write start: total_size=" << total_size
              << ", chunk_size=" << socket.get_buffer_size()
              << ", send_window=" << socket.get_send_window_size();
-  auto state = std::make_shared<detail::urma_write_completion_state>();
-  std::size_t in_flight = 0;
-  auto post_next = [&]() -> std::pair<std::error_code, bool> {
-    if (buffers.empty()) return {{}, false};
+
+  // Fire-and-forget send: post all chunks to hardware and return immediately.
+  // CQEs are reclaimed asynchronously by the poll thread's on_send_completion
+  // (which returns the send buffer to the pool and manages flow control via
+  // wake_writer).  This eliminates the wait_send_completion latency (~9us)
+  // from the send path - send becomes just memcpy + urma_post_jetty_send_wr.
+  //
+  // Flow control: if the send window is full (in_flight >= window), wait for
+  // a slot via waiting_write_over() (which suspends until a CQE frees a slot).
+  // In latency mode (1 chunk, window=4) this never triggers.
+  const auto send_window = std::max<std::size_t>(socket.get_send_window_size(), 1);
+  while (!buffers.empty()) {
+    // Wait for a free send slot if the window is full.
+    while (socket.sent_request_count() >= send_window) {
+      auto ec = co_await socket.waiting_write_over();
+      if (ec) co_return std::pair{ec, completed};
+    }
     auto buffer = socket.get_send_buffer();
     if (!buffer)
-      return {std::make_error_code(std::errc::no_buffer_space), false};
+      co_return std::pair{std::make_error_code(std::errc::no_buffer_space),
+                          completed};
     std::size_t length = 0;
     auto copy_begin = urma_benchmark_profile::enabled()
                           ? urma_benchmark_profile::now_ns()
@@ -238,38 +252,15 @@ async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>> async_write(
     auto post_begin = urma_benchmark_profile::enabled()
                           ? urma_benchmark_profile::now_ns()
                           : 0;
+    // Fire-and-forget: the callback just returns the buffer.  No
+    // urma_write_completion_state, no wait, no spin.
     socket.post_send(std::move(buffer), length,
-                     [state](std::pair<std::error_code, std::size_t> result) {
-                       state->push(result);
-                     });
+                     [](std::pair<std::error_code, std::size_t>) {});
     urma_benchmark_profile::record_since_with_size(
         urma_benchmark_profile::stage::urma_post_send, post_begin, length);
-    ++in_flight;
-    return {{}, true};
-  };
-
-  const auto send_window = std::max<std::size_t>(socket.get_send_window_size(), 1);
-  while (!buffers.empty() || in_flight != 0) {
-    while (!buffers.empty() && in_flight < send_window) {
-      auto [ec, posted] = post_next();
-      if (ec) {
-        if (in_flight == 0) co_return std::pair{ec, completed};
-        break;
-      }
-      if (!posted) break;
-    }
-    if (in_flight == 0) continue;
-    auto wait_begin = urma_benchmark_profile::enabled()
-                          ? urma_benchmark_profile::now_ns()
-                          : 0;
-    auto result = co_await detail::wait_urma_write_completion(state, socket);
-    urma_benchmark_profile::record_since_with_size(
-        urma_benchmark_profile::stage::urma_wait_send_completion,
-        wait_begin, result.second);
-    --in_flight;
-    if (result.first) co_return std::pair{result.first, completed};
-    completed += result.second;
+    completed += length;
   }
+
   ELOG_DEBUG << "URMA async_write done: total_size=" << total_size
              << ", completed=" << completed;
   urma_benchmark_profile::record_since_with_size(

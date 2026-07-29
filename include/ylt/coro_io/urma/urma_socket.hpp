@@ -782,7 +782,14 @@ struct urma_socket_shared_state_t
 
   async_simple::coro::Lazy<std::error_code> wait_for_send_slot(
       std::size_t limit) {
-    if (send_callbacks_.size() < limit) co_return std::error_code{};
+    std::size_t in_flight;
+    if (thread_pool_mode_) {
+      std::lock_guard lk(send_handoff_mtx_);
+      in_flight = pending_send_by_seq_.size();
+    } else {
+      in_flight = send_callbacks_.size();
+    }
+    if (in_flight < limit) co_return std::error_code{};
     write_promise_.emplace();
     co_return co_await write_promise_->getFuture();
   }
@@ -1223,6 +1230,10 @@ class urma_socket_t {
   void poll_completion_once() { state_->poll_completion(); }
 
   std::size_t sent_request_count() const noexcept {
+    if (state_->thread_pool_mode_) {
+      std::lock_guard lk(state_->send_handoff_mtx_);
+      return state_->pending_send_by_seq_.size();
+    }
     return state_->send_callbacks_.size();
   }
 

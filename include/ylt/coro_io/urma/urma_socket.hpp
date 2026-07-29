@@ -385,7 +385,8 @@ struct urma_socket_shared_state_t
       uint64_t expected =
           recv_consumed_seq_.load(std::memory_order_acquire);
       if (recv_seq_.load(std::memory_order_acquire) != expected) {
-        recv_buffer_ = recv_completed_buffer_;
+        recv_buffer_ = std::move(recv_completed_buffer_);
+        recv_completed_buffer_ = {};
         recv_consumed_seq_.store(
             recv_seq_.load(std::memory_order_relaxed),
             std::memory_order_release);
@@ -489,7 +490,8 @@ struct urma_socket_shared_state_t
         recv_consumed_seq_.store(
             recv_seq_.load(std::memory_order_relaxed),
             std::memory_order_release);
-        recv_buffer_ = recv_completed_buffer_;
+        recv_buffer_ = std::move(recv_completed_buffer_);
+        recv_completed_buffer_ = {};
       }
     }
     // Refill recv queue outside the lock (hardware post, may be slow).

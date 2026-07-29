@@ -42,32 +42,36 @@ void make_urma_buffers(std::vector<AsioBuffer>& result,
 }
 
 struct urma_write_completion_state {
-  // Single-slot result.  push() (poll thread) writes the result under mtx and
-  // bumps seq_ (release).  The coroutine first does a short busy-spin on seq_
-  // (no yield, no mutex - pure atomic acquire, ~1-2us for 8 iterations); if the
-  // result arrives within the spin it consumes it with ZERO poll-thread
-  // involvement (no resume, no hardware-op blocking the poll thread).  If the
-  // spin misses, it falls back to suspend + resume_handler (push fires it).
+  // Lock-free single-slot result.  push() (poll thread) writes the result to
+  // atomic fields and bumps seq_ (release).  The coroutine spins on seq_
+  // (acquire) and reads the result directly from atomics - NO mutex in the
+  // fast path.  The mutex is only used in the rare slow path (spin missed,
+  // coroutine suspends).
+  //   seq_: 0 = no result pending; 1 = result ready.
   std::atomic<uint64_t> seq_{0};
-  std::pair<std::error_code, std::size_t> result;
-  bool has_result_ = false;  // protected by mtx
+  // Result stored as two atomics so the coroutine can read them lock-free
+  // after observing seq_ change.
+  std::atomic<uint32_t> ec_value_{0};       // std::error_code::value()
+  std::atomic<std::size_t> length_{0};
+  // Slow-path only (mutex protects resume_handler + has_result_).
   std::mutex mtx;
+  bool has_result_ = false;
   async_simple::util::move_only_function<void()> resume_handler;
 
   void push(std::pair<std::error_code, std::size_t> r) {
+    // Write result to atomics first (relaxed - seq_ release publishes them).
+    ec_value_.store(static_cast<uint32_t>(r.first.value()),
+                    std::memory_order_relaxed);
+    length_.store(r.second, std::memory_order_relaxed);
+    seq_.store(1, std::memory_order_release);  // publish
+    // Check if the coroutine suspended (slow path).
     async_simple::util::move_only_function<void()> h;
     {
       std::lock_guard lk(mtx);
-      result = r;
       has_result_ = true;
-      seq_.fetch_add(1, std::memory_order_release);
       h = std::move(resume_handler);
       resume_handler = nullptr;
     }
-    // Only resume if the coroutine suspended (spin missed).  In the common
-    // case the coroutine catches the result in its spin and never suspends,
-    // so h is null and the poll thread does NOT resume any coroutine - it
-    // just writes the atomic and continues polling.
     if (h) h();
   }
 };
@@ -76,41 +80,22 @@ inline async_simple::coro::Lazy<std::pair<std::error_code, std::size_t>>
 wait_urma_write_completion(
     const std::shared_ptr<urma_write_completion_state>& state,
     urma_socket_t& socket) {
-  // Phase 1: short busy-spin on seq_ (pure atomic, no mutex, no yield).
-  // In latency mode (serial, one connection) the CQE arrives in 1-10us and
-  // the spin catches it - the poll thread never resumes the coroutine, so
-  // no hardware-op (urma_post_jetty_send_wr) runs on the poll thread.
-  uint64_t before = state->seq_.load(std::memory_order_acquire);
-  for (int i = 0; i < 8; ++i) {
-    if (state->seq_.load(std::memory_order_acquire) != before) {
-      std::pair<std::error_code, std::size_t> r;
-      {
-        std::lock_guard lk(state->mtx);
-        r = state->result;
-        state->has_result_ = false;
-      }
-      co_return r;
-    }
-    // No yield: tight spin for minimum latency.  8 iterations is ~1-2us.
+  (void)socket;
+  // Phase 1: busy-spin on seq_ (pure atomic, no mutex, no yield).
+  // CQE arrives in 1-10us; spin catches it -> read result from atomics ->
+  // return.  Zero mutex, zero poll-thread involvement.
+  while (state->seq_.load(std::memory_order_acquire) == 0) {
+    // tight spin
   }
-  // Phase 2: spin missed (rare).  Suspend; push() will resume us.
-  callback_awaitor<void> awaitor;
-  co_await awaitor.await_resume([&state, &socket](auto handler) {
-    std::lock_guard lk(state->mtx);
-    if (state->has_result_) {
-      asio::post(socket.get_executor(),
-                 [handler]() mutable { handler.resume(); });
-    } else {
-      state->resume_handler = [handler]() mutable { handler.resume(); };
-    }
-  });
-  std::pair<std::error_code, std::size_t> r;
-  {
-    std::lock_guard lk(state->mtx);
-    r = state->result;
-    state->has_result_ = false;
-  }
-  co_return r;
+  // Result is ready: read from atomics (no mutex).
+  auto ec_val = state->ec_value_.load(std::memory_order_relaxed);
+  auto len = state->length_.load(std::memory_order_relaxed);
+  // Reset for next send.
+  state->seq_.store(0, std::memory_order_release);
+  std::error_code ec = ec_val
+      ? std::error_code(ec_val, std::generic_category())
+      : std::error_code{};
+  co_return std::pair{ec, len};
 }
 
 template <typename Buffer>

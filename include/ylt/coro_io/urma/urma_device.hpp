@@ -21,14 +21,14 @@
 #include <vector>
 #include <cstring>
 #include <algorithm>
+#include <mutex>
 
 #include "ylt/easylog.hpp"
 #include "ylt/coro_io/urma/urma_buffer.hpp"
 
-#include <urma_ubagg.h>
-
 #ifdef YLT_ENABLE_URMA
 #include <urma_api.h>
+#include <urma_ubagg.h>
 #endif
 
 namespace coro_io {
@@ -67,7 +67,10 @@ class urma_device_wrapper_t {
   std::string eid_string() const;
   asio::ip::address gid_address() const;
   bool is_valid() const { return context_ != nullptr && device_ptr_ != nullptr; }
-  std::shared_ptr<urma_buffer_pool_t> get_buffer_pool() const { return buffer_pool_; }
+  std::shared_ptr<urma_buffer_pool_t> get_buffer_pool() const {
+    std::lock_guard lock(buffer_pool_mutex_);
+    return buffer_pool_;
+  }
 
   void set_bonding_config(uint32_t mode, uint32_t level) {
     bond_mode_ = mode;
@@ -82,6 +85,7 @@ class urma_device_wrapper_t {
   urma_eid_t eid_{};
   urma_device_attr_t device_attr_{};
   std::shared_ptr<urma_buffer_pool_t> buffer_pool_;
+  mutable std::mutex buffer_pool_mutex_;
   uint32_t bond_mode_ = BONDP_BONDING_MODE_STANDALONE;
   uint32_t bond_level_ = BONDP_BONDING_LEVEL_IODIE;
 };
@@ -144,6 +148,7 @@ inline urma_device_wrapper_t::~urma_device_wrapper_t() { close(); }
 
 inline bool urma_device_wrapper_t::configure_buffer_pool(
     std::size_t buffer_size, std::size_t max_memory_usage) {
+  std::lock_guard lock(buffer_pool_mutex_);
   if (!context_ || buffer_size == 0) return false;
   auto requested_buffer_count =
       std::max<std::size_t>(1, max_memory_usage / buffer_size);
@@ -288,7 +293,10 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name, int eid_
 inline void urma_device_wrapper_t::close() {
 #ifdef YLT_ENABLE_URMA
   if (context_) {
-    buffer_pool_.reset();
+    {
+      std::lock_guard lock(buffer_pool_mutex_);
+      buffer_pool_.reset();
+    }
     urma_delete_context(context_);
     context_ = nullptr;
   }

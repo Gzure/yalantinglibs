@@ -49,7 +49,6 @@
 #include "coro_io.hpp"
 #include "detail/client_queue.hpp"
 #include "io_context_pool.hpp"
-#include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
 #include "ylt/easylog.hpp"
 #include "ylt/util/atomic_shared_ptr.hpp"
 #ifdef YLT_ENABLE_IBV
@@ -317,13 +316,7 @@ class client_pool : public std::enable_shared_from_this<
           ELOG_ERROR << "init client config failed.";
           co_return nullptr;
         }
-      auto connect_begin = coro_io::urma_benchmark_profile::enabled()
-                             ? coro_io::urma_benchmark_profile::now_ns()
-                             : 0;
       co_await reconnect(client, this->weak_from_this());
-      coro_io::urma_benchmark_profile::record_since(
-          coro_io::urma_benchmark_profile::stage::client_connect_total,
-          connect_begin);
     }
     else {
       ELOG_TRACE << "get free client{" << client.get() << "}. from queue";

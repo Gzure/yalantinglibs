@@ -116,6 +116,7 @@ struct urma_socket_shared_state_t
                              std::size_t cq_size)
       : executor_(executor),
         device_(std::move(device)),
+        buffer_pool_(device_->get_buffer_pool()),
         socket_(executor->get_asio_executor()),
         poll_timer_(executor->get_asio_executor()),
         recv_buffer_cnt_(recv_buffer_cnt),
@@ -257,7 +258,7 @@ struct urma_socket_shared_state_t
 
   std::error_code fill_recv_queue() {
     while (recv_queue_.size() < recv_buffer_cnt_) {
-      auto buffer = device_->get_buffer_pool()->get_buffer();
+      auto buffer = buffer_pool_->get_buffer();
       if (!buffer) return std::make_error_code(std::errc::no_buffer_space);
       auto ec = post_recv(std::move(buffer));
       if (ec) return ec;
@@ -268,7 +269,7 @@ struct urma_socket_shared_state_t
   void post_send(urma_buffer_t buffer, std::size_t length,
                  callback_t&& callback) {
     if (has_close_ || !remote_jetty_) {
-      if (buffer) device_->get_buffer_pool()->return_buffer(buffer);
+      if (buffer) buffer_pool_->return_buffer(buffer);
       resume({std::make_error_code(std::errc::not_connected), 0},
              std::move(callback));
       return;
@@ -290,7 +291,7 @@ struct urma_socket_shared_state_t
     auto ec =
         make_urma_error(urma_post_jetty_send_wr(jetty_.get(), &wr, &bad_wr));
     if (ec) {
-      if (buffer) device_->get_buffer_pool()->return_buffer(buffer);
+      if (buffer) buffer_pool_->return_buffer(buffer);
       resume({ec, 0}, std::move(callback));
       return;
     }
@@ -341,7 +342,7 @@ struct urma_socket_shared_state_t
           if (send_callbacks_.empty()) continue;
           auto pending = send_callbacks_.pop();
           if (pending.buffer)
-            device_->get_buffer_pool()->return_buffer(pending.buffer);
+            buffer_pool_->return_buffer(pending.buffer);
           resume({ec, pending.length}, std::move(pending.callback));
           wake_writer(ec);
           continue;
@@ -374,7 +375,7 @@ struct urma_socket_shared_state_t
           if (recv_result_.full()) {
             ELOG_ERROR << "URMA recv result queue is full; cannot cache "
                           "completed recv buffer";
-            device_->get_buffer_pool()->return_buffer(completed_buffer);
+            buffer_pool_->return_buffer(completed_buffer);
             return {std::make_error_code(std::errc::no_buffer_space), polled};
           }
           recv_result_.push(
@@ -568,7 +569,7 @@ struct urma_socket_shared_state_t
     while (!send_callbacks_.empty()) {
       auto pending = send_callbacks_.pop();
       if (pending.buffer)
-        device_->get_buffer_pool()->return_buffer(pending.buffer);
+        buffer_pool_->return_buffer(pending.buffer);
       resume({ec, 0}, std::move(pending.callback));
     }
     wake_writer(ec);
@@ -586,10 +587,14 @@ struct urma_socket_shared_state_t
 
   void release_resources() {
     close();
-    if (recv_buffer_) device_->get_buffer_pool()->return_buffer(recv_buffer_);
+    if (recv_buffer_) buffer_pool_->return_buffer(recv_buffer_);
+    while (!recv_result_.empty()) {
+      auto pending = recv_result_.pop();
+      if (pending.buffer) buffer_pool_->return_buffer(pending.buffer);
+    }
     while (!recv_queue_.empty()) {
       auto buffer = recv_queue_.pop();
-      device_->get_buffer_pool()->return_buffer(buffer);
+      buffer_pool_->return_buffer(buffer);
     }
     // Release stream_descriptor before closing the jfce fd it wraps.
     event_fd_.reset();
@@ -603,6 +608,7 @@ struct urma_socket_shared_state_t
 
   ExecutorWrapper<>* executor_;
   std::shared_ptr<urma_device_wrapper_t> device_;
+  std::shared_ptr<urma_buffer_pool_t> buffer_pool_;
   asio::ip::tcp::socket socket_;
   asio::steady_timer poll_timer_;
   std::unique_ptr<urma_jfc_t, urma_deleter> jfc_;
@@ -709,7 +715,7 @@ class urma_socket_t {
   const config_t& get_config() const noexcept { return conf_; }
   uint32_t get_buffer_size() const noexcept { return buffer_size_; }
   std::shared_ptr<urma_buffer_pool_t> buffer_pool() const {
-    return state_->device_->get_buffer_pool();
+    return state_->buffer_pool_;
   }
 
   async_simple::coro::Lazy<std::error_code> connect(
@@ -931,11 +937,11 @@ class urma_socket_t {
       ELOG_WARN << "URMA device capability does not report RM RTP support; "
                    "continuing and relying on resource creation";
     }
-    buffer_size_ = std::min<uint32_t>(
-        conf_.buffer_size, device->get_buffer_pool()->buffer_size());
     state_ = std::make_shared<detail::urma_socket_shared_state_t>(
         std::move(device), executor_, conf_.recv_buffer_cnt,
         conf_.send_buffer_cnt, conf_.cq_size);
+    buffer_size_ = std::min<uint32_t>(
+        conf_.buffer_size, state_->buffer_pool_->buffer_size());
     state_->busy_poll_budget_ = conf_.busy_poll_budget;
     state_->idle_poll_interval_ = conf_.poll_interval;
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode)) {
@@ -1115,7 +1121,7 @@ class urma_socket_t {
 
   void release_recv_buffer() {
     if (state_->recv_buffer_)
-      state_->device_->get_buffer_pool()->return_buffer(state_->recv_buffer_);
+      state_->buffer_pool_->return_buffer(state_->recv_buffer_);
   }
 
   void close_handshake_socket() {

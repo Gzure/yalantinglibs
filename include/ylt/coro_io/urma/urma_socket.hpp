@@ -47,6 +47,7 @@
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/coro_io/data_view.hpp"
 #include "ylt/coro_io/detail/circle_buffer.hpp"
+#include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
 #include "ylt/coro_io/urma/urma_buffer.hpp"
 #include "ylt/coro_io/urma/urma_device.hpp"
 #include "ylt/easylog.hpp"

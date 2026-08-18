@@ -1918,10 +1918,7 @@ class coro_rpc_client {
         std::lock_guard lock(control_->response_handler_mtx_);
         control_->response_handler_table_.erase(id);
       }
-      if (handler) {
-        auto error = result;
-        handler->local_error(error);
-      }
+      handler->timer().cancel();
       co_return build_failed_rpc_result<rpc_return_t>(std::move(result));
     }
     // Ensure at most one recv coroutine runs per connection.

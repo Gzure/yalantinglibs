@@ -482,8 +482,9 @@ Lazy<bool> issue_rpc_call(coro_rpc_client& client, const std::string& payload,
         request_config_t{30s, payload, {}, -1, -1});
     if (!result)
       ELOG_ERROR << "attach_sink RPC failed: code="
-                 << static_cast<int>(result.error().code)
-                 << ", message=" << result.error().msg;
+                 << result.error().code.val() << " ("
+                 << result.error().code.message() << "), message="
+                 << result.error().msg;
     ok = result && result.value() == payload.size();
     if (profile_call) {
       coro_io::urma_benchmark_profile::record_since_with_size(
@@ -496,8 +497,9 @@ Lazy<bool> issue_rpc_call(coro_rpc_client& client, const std::string& payload,
     auto result = co_await client.call_for<bench_sink>(30s, payload);
     if (!result)
       ELOG_ERROR << "sink RPC failed: code="
-                 << static_cast<int>(result.error().code)
-                 << ", message=" << result.error().msg;
+                 << result.error().code.val() << " ("
+                 << result.error().code.message() << "), message="
+                 << result.error().msg;
     ok = result && result.value() == payload.size();
     if (profile_call) {
       coro_io::urma_benchmark_profile::record_since_with_size(
@@ -509,8 +511,9 @@ Lazy<bool> issue_rpc_call(coro_rpc_client& client, const std::string& payload,
   auto result = co_await client.call_for<bench_echo>(30s, payload);
   if (!result)
     ELOG_ERROR << "echo RPC failed: code="
-               << static_cast<int>(result.error().code)
-               << ", message=" << result.error().msg;
+               << result.error().code.val() << " ("
+               << result.error().code.message() << "), message="
+               << result.error().msg;
   ok = result && result.value().size() == payload.size();
   if (profile_call) {
     coro_io::urma_benchmark_profile::record_since_with_size(

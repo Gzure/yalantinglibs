@@ -471,7 +471,7 @@ struct urma_socket_shared_state_t
     // then yield to the io_context, so the timer machinery stays off the hot
     // path and completion latency is one poll round. The cost is one busy core
     // per reactor thread owning a timer-mode socket: bound it with
-    // --rpc_thread_num on the server, or set URMA_RPC_POLL_SPIN=0 to get the
+    // --rpc_thread_num on the server, or set MC_YLT_URMA_POLL_SPIN=0 to get the
     // timer cadence back.
     const std::size_t inline_rounds = poll_spin_ ? kPollInlineBatch : 1;
     for (std::size_t round = 0; round < inline_rounds; ++round) {
@@ -485,7 +485,7 @@ struct urma_socket_shared_state_t
       }
       if (poll_spin_)
         continue;
-      // Timer cadence (URMA_RPC_POLL_SPIN=0): after an active burst, or when
+      // Timer cadence (MC_YLT_URMA_POLL_SPIN=0): after an active burst, or when
       // idle, hand the thread back to the reactor for poll_interval.
       if (completion_count == 0 || active_poll_budget_ == 0) {
         active_poll_budget_ = max_active_poll_budget_;
@@ -867,7 +867,7 @@ class urma_socket_t {
     // timer tick costs two timerfd_settime plus an epoll wake-up. This removes
     // the per-socket timerfd storm and cuts completion latency to one poll
     // round, at the cost of one busy core per reactor thread that owns a
-    // timer-mode socket. Set URMA_RPC_POLL_SPIN=0 to restore the timer cadence.
+    // timer-mode socket. Set MC_YLT_URMA_POLL_SPIN=0 to restore the timer cadence.
     bool poll_spin = true;
   };
 

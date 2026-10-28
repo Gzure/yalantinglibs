@@ -46,7 +46,7 @@ inline const char* urma_rpc_getenv(const char* name) {
 }
 
 inline bool urma_rpc_env_enabled() {
-  const char* value = urma_rpc_getenv("URMA_RPC_ENABLE");
+  const char* value = urma_rpc_getenv("MC_YLT_URMA_ENABLE");
   if (value == nullptr || *value == '\0')
     return false;
 
@@ -100,7 +100,7 @@ inline void urma_rpc_parse_env_integer(const char* name, T& field) {
 }
 
 inline void urma_rpc_parse_env_tp_type(urma_tp_type_t& tp_type) {
-  const char* value = urma_rpc_getenv("URMA_RPC_TP_TYPE");
+  const char* value = urma_rpc_getenv("MC_YLT_URMA_TP_TYPE");
   if (value == nullptr || *value == '\0')
     return;
 
@@ -114,70 +114,70 @@ inline void urma_rpc_parse_env_tp_type(urma_tp_type_t& tp_type) {
     return;
   }
 
-  ELOG_WARN << "invalid URMA_RPC_TP_TYPE value: " << value << "; use default "
+  ELOG_WARN << "invalid MC_YLT_URMA_TP_TYPE value: " << value << "; use default "
             << static_cast<int>(tp_type);
 }
 
 inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
   coro_io::urma_socket_t::config_t config{};
 
-  if (const char* device = urma_rpc_getenv("URMA_RPC_DEVICE");
+  if (const char* device = urma_rpc_getenv("MC_YLT_URMA_DEVICE");
       device != nullptr) {
     config.device_name = device;
   }
 
-  urma_rpc_parse_env_integer("URMA_RPC_EID_INDEX", config.eid_index);
-  urma_rpc_parse_env_integer("URMA_RPC_CQ_SIZE", config.cq_size);
-  urma_rpc_parse_env_integer("URMA_RPC_RECV_BUFFER_CNT",
+  urma_rpc_parse_env_integer("MC_YLT_URMA_EID_INDEX", config.eid_index);
+  urma_rpc_parse_env_integer("MC_YLT_URMA_CQ_SIZE", config.cq_size);
+  urma_rpc_parse_env_integer("MC_YLT_URMA_RECV_BUFFER_CNT",
                              config.recv_buffer_cnt);
-  urma_rpc_parse_env_integer("URMA_RPC_SEND_BUFFER_CNT",
+  urma_rpc_parse_env_integer("MC_YLT_URMA_SEND_BUFFER_CNT",
                              config.send_buffer_cnt);
-  urma_rpc_parse_env_integer("URMA_RPC_BUFFER_SIZE", config.buffer_size);
-  urma_rpc_parse_env_integer("URMA_RPC_MAX_MEMORY_USAGE",
+  urma_rpc_parse_env_integer("MC_YLT_URMA_BUFFER_SIZE", config.buffer_size);
+  urma_rpc_parse_env_integer("MC_YLT_URMA_MAX_MEMORY_USAGE",
                              config.max_memory_usage);
   urma_rpc_parse_env_tp_type(config.tp_type);
   auto default_priority = config.jfs_priority;
-  urma_rpc_parse_env_integer("URMA_RPC_PRIORITY", config.jfs_priority);
+  urma_rpc_parse_env_integer("MC_YLT_URMA_PRIORITY", config.jfs_priority);
   if (config.jfs_priority > 15) {
-    ELOG_WARN << "invalid URMA_RPC_PRIORITY value; use default "
+    ELOG_WARN << "invalid MC_YLT_URMA_PRIORITY value; use default "
               << static_cast<unsigned>(default_priority);
     config.jfs_priority = default_priority;
   }
   config.event_mode =
-      urma_rpc_env_flag("URMA_RPC_EVENT_MODE", /*default*/ true);
-  urma_rpc_parse_env_integer("URMA_RPC_BUSY_POLL_BUDGET",
+      urma_rpc_env_flag("MC_YLT_URMA_EVENT_MODE", /*default*/ true);
+  urma_rpc_parse_env_integer("MC_YLT_URMA_BUSY_POLL_BUDGET",
                              config.busy_poll_budget);
-  urma_rpc_parse_env_integer("URMA_RPC_PENDING_POLL_BUDGET",
+  urma_rpc_parse_env_integer("MC_YLT_URMA_PENDING_POLL_BUDGET",
                              config.pending_poll_budget);
-  urma_rpc_parse_env_integer("URMA_RPC_JFC_MODERATE_COUNT",
+  urma_rpc_parse_env_integer("MC_YLT_URMA_JFC_MODERATE_COUNT",
                              config.jfc_moderate_count);
-  urma_rpc_parse_env_integer("URMA_RPC_JFC_MODERATE_PERIOD",
+  urma_rpc_parse_env_integer("MC_YLT_URMA_JFC_MODERATE_PERIOD",
                              config.jfc_moderate_period);
   constexpr std::size_t max_pending_poll_budget = 4096;
   if (config.pending_poll_budget > max_pending_poll_budget) {
-    ELOG_WARN << "URMA_RPC_PENDING_POLL_BUDGET=" << config.pending_poll_budget
+    ELOG_WARN << "MC_YLT_URMA_PENDING_POLL_BUDGET=" << config.pending_poll_budget
               << " is too large; clamped to " << max_pending_poll_budget
               << " (the reactor thread would otherwise spin for too long)";
     config.pending_poll_budget = max_pending_poll_budget;
   }
   if (config.jfc_moderate_count <= 0 || config.jfc_moderate_count > 0xFFFF) {
-    ELOG_WARN << "invalid URMA_RPC_JFC_MODERATE_COUNT value: "
+    ELOG_WARN << "invalid MC_YLT_URMA_JFC_MODERATE_COUNT value: "
               << config.jfc_moderate_count
               << "; CQ event moderation count kept as driver default";
     config.jfc_moderate_count = -1;
   }
   if (config.jfc_moderate_period > 0xFFFF) {
-    ELOG_WARN << "invalid URMA_RPC_JFC_MODERATE_PERIOD value: "
+    ELOG_WARN << "invalid MC_YLT_URMA_JFC_MODERATE_PERIOD value: "
               << config.jfc_moderate_period
               << "; CQ event moderation period kept as driver default";
     config.jfc_moderate_period = -1;
   }
   {
     uint64_t interval_us = 5;
-    urma_rpc_parse_env_integer("URMA_RPC_POLL_INTERVAL", interval_us);
+    urma_rpc_parse_env_integer("MC_YLT_URMA_POLL_INTERVAL", interval_us);
     config.poll_interval = std::chrono::microseconds(interval_us);
   }
-  config.poll_spin = urma_rpc_env_flag("URMA_RPC_POLL_SPIN", /*default*/ true);
+  config.poll_spin = urma_rpc_env_flag("MC_YLT_URMA_POLL_SPIN", /*default*/ true);
 
   return config;
 }
@@ -191,7 +191,7 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
                                 .max_memory_usage = config.max_memory_usage},
          .eid_index = config.eid_index});
     if (!device || !device->is_valid() || !device->get_buffer_pool()) {
-      ELOG_WARN << "URMA_RPC_ENABLE is enabled but no usable URMA device was "
+      ELOG_WARN << "MC_YLT_URMA_ENABLE is enabled but no usable URMA device was "
                    "found; fall back to TCP";
       return std::nullopt;
     }

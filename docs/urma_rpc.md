@@ -90,40 +90,40 @@ client.init_urma(config);
 
 ## 4. 环境变量自动升级
 
-默认 TCP 配置下，设置 `URMA_RPC_ENABLE=1` 可自动探测 URMA 设备并升级：
+默认 TCP 配置下，设置 `MC_YLT_URMA_ENABLE=1` 可自动探测 URMA 设备并升级：
 
 ```bash
-export URMA_RPC_ENABLE=1
-export URMA_RPC_DEVICE=bonding_dev_0
-export URMA_RPC_EID_INDEX=0
+export MC_YLT_URMA_ENABLE=1
+export MC_YLT_URMA_DEVICE=bonding_dev_0
+export MC_YLT_URMA_EID_INDEX=0
 ```
 
-`URMA_RPC_ENABLE` 接受 `1`、`on`、`true`、`yes`。未设置、关闭或设备探测失败时回退 TCP。显式调用 `init_urma(config)` 的配置优先。
+`MC_YLT_URMA_ENABLE` 接受 `1`、`on`、`true`、`yes`。未设置、关闭或设备探测失败时回退 TCP。显式调用 `init_urma(config)` 的配置优先。
 
 | 变量 | 作用 |
 | --- | --- |
-| `URMA_RPC_ENABLE` | 启用自动升级 |
-| `URMA_RPC_DEVICE` | 设备名；为空时自动选择 |
-| `URMA_RPC_EID_INDEX` | EID 下标，默认 `0` |
-| `URMA_RPC_CQ_SIZE` | completion queue 大小 |
-| `URMA_RPC_RECV_BUFFER_CNT` / `URMA_RPC_SEND_BUFFER_CNT` | 收发 buffer 数 |
-| `URMA_RPC_BUFFER_SIZE` | 单个 buffer 大小 |
-| `URMA_RPC_MAX_MEMORY_USAGE` | buffer pool 上限，单位 byte |
-| `URMA_RPC_TP_TYPE` | `ctp`、`rtp` 或其他支持的类型 |
-| `URMA_RPC_PRIORITY` | JFS priority，范围 `0~15`，默认值为 `15` |
-| `URMA_RPC_EVENT_MODE` | JFCE 事件模式开关 |
-| `URMA_RPC_BUSY_POLL_BUDGET` | 事件唤醒后、**没有在途 send/recv 回调**时的空轮询预算（抓空闲突发），默认 `16`；实际执行 `budget+1` 次空 polling |
-| `URMA_RPC_PENDING_POLL_BUDGET` | 事件唤醒后、**仍有在途 send/recv 回调**时的空轮询预算，默认 `1`（实际 `budget+1` 次）：事件已被 jfce fd 交付，抽干即回到 rearm+wait；保留 1 次是为了覆盖"CQE 落在最后一次抽干与 rearm 之间"的窗口。设为 `0` 用于极限压测 |
-| `URMA_RPC_JFC_MODERATE_COUNT` / `URMA_RPC_JFC_MODERATE_PERIOD` | JFC 完成事件合并参数（`urma_modify_jfc`），默认 `1` / `-1`：`count=1` 让每个 CQE 立刻产生事件，`period` 保留驱动默认。驱动默认合并会把 JFCE 唤醒延迟抬到 `moderate_period` 量级（实测 50~300µs），对 13~20µs RTT 目标是致命的；任一字段设 `-1` 表示该字段沿用驱动默认（A/B 对照）。**吞吐提示**：`count=1` 下 jfce 事件数随 CQE 线性增长，极高吞吐场景可改用 `count=16`/`period=10` 或 `-1`/`-1` |
-| `URMA_RPC_POLL_INTERVAL` | timer 兜底路径的轮询间隔，单位微秒 |
-| `URMA_RPC_POLL_SPIN` | timer 兜底路径（`URMA_RPC_EVENT_MODE=0`）的轮询方式，默认 `1`：在 reactor 线程内连续轮询（每 8 轮让出一次 io_context），不再为每个 5µs tick arm `asio::steady_timer`。单次轮询是用户态 `udma_u_poll_jfc`，而一次 timer tick 是 2 次 `timerfd_settime` + 1 次 epoll 唤醒（≈3.5µs CPU / 5µs 周期/连接）。代价：持有 timer 模式 socket 的 reactor 线程会占满一个核。设 `0` 恢复原 timer 节奏（空闲省 CPU，但保留 timerfd 风暴） |
+| `MC_YLT_URMA_ENABLE` | 启用自动升级 |
+| `MC_YLT_URMA_DEVICE` | 设备名；为空时自动选择 |
+| `MC_YLT_URMA_EID_INDEX` | EID 下标，默认 `0` |
+| `MC_YLT_URMA_CQ_SIZE` | completion queue 大小 |
+| `MC_YLT_URMA_RECV_BUFFER_CNT` / `MC_YLT_URMA_SEND_BUFFER_CNT` | 收发 buffer 数 |
+| `MC_YLT_URMA_BUFFER_SIZE` | 单个 buffer 大小 |
+| `MC_YLT_URMA_MAX_MEMORY_USAGE` | buffer pool 上限，单位 byte |
+| `MC_YLT_URMA_TP_TYPE` | `ctp`、`rtp` 或其他支持的类型 |
+| `MC_YLT_URMA_PRIORITY` | JFS priority，范围 `0~15`，默认值为 `15` |
+| `MC_YLT_URMA_EVENT_MODE` | JFCE 事件模式开关 |
+| `MC_YLT_URMA_BUSY_POLL_BUDGET` | 事件唤醒后、**没有在途 send/recv 回调**时的空轮询预算（抓空闲突发），默认 `16`；实际执行 `budget+1` 次空 polling |
+| `MC_YLT_URMA_PENDING_POLL_BUDGET` | 事件唤醒后、**仍有在途 send/recv 回调**时的空轮询预算，默认 `1`（实际 `budget+1` 次）：事件已被 jfce fd 交付，抽干即回到 rearm+wait；保留 1 次是为了覆盖"CQE 落在最后一次抽干与 rearm 之间"的窗口。设为 `0` 用于极限压测 |
+| `MC_YLT_URMA_JFC_MODERATE_COUNT` / `MC_YLT_URMA_JFC_MODERATE_PERIOD` | JFC 完成事件合并参数（`urma_modify_jfc`），默认 `1` / `-1`：`count=1` 让每个 CQE 立刻产生事件，`period` 保留驱动默认。驱动默认合并会把 JFCE 唤醒延迟抬到 `moderate_period` 量级（实测 50~300µs），对 13~20µs RTT 目标是致命的；任一字段设 `-1` 表示该字段沿用驱动默认（A/B 对照）。**吞吐提示**：`count=1` 下 jfce 事件数随 CQE 线性增长，极高吞吐场景可改用 `count=16`/`period=10` 或 `-1`/`-1` |
+| `MC_YLT_URMA_POLL_INTERVAL` | timer 兜底路径的轮询间隔，单位微秒 |
+| `MC_YLT_URMA_POLL_SPIN` | timer 兜底路径（`MC_YLT_URMA_EVENT_MODE=0`）的轮询方式，默认 `1`：在 reactor 线程内连续轮询（每 8 轮让出一次 io_context），不再为每个 5µs tick arm `asio::steady_timer`。单次轮询是用户态 `udma_u_poll_jfc`，而一次 timer tick 是 2 次 `timerfd_settime` + 1 次 epoll 唤醒（≈3.5µs CPU / 5µs 周期/连接）。代价：持有 timer 模式 socket 的 reactor 线程会占满一个核。设 `0` 恢复原 timer 节奏（空闲省 CPU，但保留 timerfd 风暴） |
 
-**timer 兜底路径的取舍**：`URMA_RPC_POLL_SPIN=1`（默认）把完成检测延迟压到一次轮询（亚微秒），代价是每个含 timer 模式 socket 的 reactor 线程一个忙核——服务端用 `--rpc_thread_num` 限核，或设 `URMA_RPC_POLL_SPIN=0` 换回定时器。若目标是 13~20µs RTT，建议优先用事件模式（`URMA_RPC_EVENT_MODE=1`）；timer 路径是事件模式不可用时的兜底。
+**timer 兜底路径的取舍**：`MC_YLT_URMA_POLL_SPIN=1`（默认）把完成检测延迟压到一次轮询（亚微秒），代价是每个含 timer 模式 socket 的 reactor 线程一个忙核——服务端用 `--rpc_thread_num` 限核，或设 `MC_YLT_URMA_POLL_SPIN=0` 换回定时器。若目标是 13~20µs RTT，建议优先用事件模式（`MC_YLT_URMA_EVENT_MODE=1`）；timer 路径是事件模式不可用时的兜底。
 
 事件模式的延迟取决于 **JFCE 唤醒延迟**，而不是轮询预算。若事件模式时延仍偏高，按下面顺序排查：
 
 1. 看启动日志 `URMA JFC event moderation applied: count=..., period_us=...`；出现 `urma_modify_jfc failed` 说明驱动不接受该参数（此时功能自动退回驱动默认，不影响正确性）。
-2. 用 `URMA_RPC_JFC_MODERATE_COUNT=-1 URMA_RPC_JFC_MODERATE_PERIOD=-1` 跑一组对照，确认延迟差异是否来自合并。
+2. 用 `MC_YLT_URMA_JFC_MODERATE_COUNT=-1 MC_YLT_URMA_JFC_MODERATE_PERIOD=-1` 跑一组对照，确认延迟差异是否来自合并。
 3. 若目标 UMDK 版本没有 `urma_modify_jfc` / `urma_jfc_attr_t`，cmake 的 `check_cxx_source_compiles` 探测会自动定义 `YLT_URMA_NO_JFC_MODERATION` 把这段编译掉；也可以手工强制关闭（**定义宏时不要带值**，写成 `-DYLT_URMA_NO_JFC_MODERATION` 而不是 `=0`）。
 
 实现位于 `include/ylt/coro_io/urma/urma_rpc_env.hpp`，行为测试位于 `src/coro_rpc/tests/test_urma_rpc.cpp`。
@@ -161,7 +161,7 @@ cmake --build build --target coro_rpc_urma_benchmark -j
 ## 7. 排障
 
 - 没有 URMA 目标：确认使用 `-DYLT_ENABLE_URMA=ON`，并安装匹配的库、头文件和驱动。
-- 自动升级未生效：确认 `URMA_RPC_ENABLE` 有效，且应用走默认 TCP 配置路径。
+- 自动升级未生效：确认 `MC_YLT_URMA_ENABLE` 有效，且应用走默认 TCP 配置路径。
 - 初始化或连接失败：检查设备名、EID、TP 类型和 TCP 握手端口。
 - 高并发下出现 RNR 或 `WR_FLUSH_ERR`：降低连接数、pipeline depth、队列深度，或增加内存上限。
 - 定位延迟：启用 benchmark 的 `--profile`，观察握手、post send、completion wait、RPC dispatch 和 attachment 阶段。

@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <async_simple/Promise.h>
+#include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
@@ -21,7 +23,10 @@
 #include <asio/ip/host_name.hpp>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
 #include <variant>
 #include <ylt/coro_io/coro_io.hpp>
@@ -61,6 +66,400 @@ Lazy<std::shared_ptr<coro_rpc_client>> create_client(
 }
 
 void show(auto& s) { return; }
+
+namespace {
+using coro_rpc_protocol = coro_rpc::protocol::coro_rpc_protocol;
+
+class rpc_trace_env {
+ public:
+  explicit rpc_trace_env(const char* value,
+                         const char* name = "YLT_RPC_TRACE")
+      : name_(name) {
+    if (const char* old = std::getenv(name)) {
+      old_ = old;
+    }
+    set(value);
+  }
+  ~rpc_trace_env() { set(old_ ? old_->c_str() : nullptr); }
+
+ private:
+  void set(const char* value) {
+#ifdef _WIN32
+    _putenv_s(name_, value ? value : "");
+#else
+    if (value) {
+      setenv(name_, value, 1);
+    }
+    else {
+      unsetenv(name_);
+    }
+#endif
+  }
+  const char* name_;
+  std::optional<std::string> old_;
+};
+
+class rpc_trace_capture {
+  struct sink {
+    std::mutex mutex;
+    bool active = false;
+    std::vector<std::string> records;
+  };
+  static auto get_sink() {
+    static auto state = std::make_shared<sink>();
+    static const bool installed = [] {
+      // The appender owns its state; no callbacks borrow a test's stack.
+      easylog::add_appender([state = state](easylog::record_t& record) {
+        auto message = record.get_message();
+        if (message.find("ylt_rpc ") != 0)
+          return;
+        std::lock_guard lock(state->mutex);
+        if (state->active)
+          state->records.emplace_back(message);
+      });
+      return true;
+    }();
+    (void)installed;
+    return state;
+  }
+
+ public:
+  rpc_trace_capture()
+      : state_(get_sink()),
+        severity_(easylog::logger<>::instance().get_min_severity()) {
+    std::lock_guard lock(state_->mutex);
+    state_->records.clear();
+    state_->active = true;
+    easylog::set_min_severity(easylog::Severity::INFO);
+  }
+  ~rpc_trace_capture() {
+    std::lock_guard lock(state_->mutex);
+    state_->active = false;
+    easylog::set_min_severity(severity_);
+  }
+  auto records() {
+    std::lock_guard lock(state_->mutex);
+    return state_->records;
+  }
+
+ private:
+  std::shared_ptr<sink> state_;
+  easylog::Severity severity_;
+};
+
+double rpc_trace_number(const std::string& line, std::string_view field) {
+  auto pos = line.find(std::string(field) + "=");
+  REQUIRE(pos != std::string::npos);
+  return std::stod(line.substr(pos + field.size() + 1));
+}
+
+std::string rpc_trace_echo(std::string value) { return value; }
+
+Lazy<std::string> rpc_trace_delayed_echo(std::string value, int delay_ms) {
+  co_await coro_io::sleep_for(std::chrono::milliseconds(delay_ms));
+  co_return value;
+}
+
+struct rpc_trace_response_gate {
+  async_simple::Promise<void> promise;
+  std::atomic<bool> released = false;
+  void release() {
+    if (!released.exchange(true))
+      promise.setValue();
+  }
+};
+
+class rpc_trace_ordering_service {
+ public:
+  explicit rpc_trace_ordering_service(
+      std::shared_ptr<rpc_trace_response_gate> gate)
+      : gate_(std::move(gate)) {}
+
+  Lazy<std::string> echo(std::string value, bool wait_for_release) {
+    // The coroutine owns the state even if the test exits through an assertion.
+    auto gate = gate_;
+    if (wait_for_release)
+      co_await gate->promise.getFuture();
+    co_return value;
+  }
+
+ private:
+  std::shared_ptr<rpc_trace_response_gate> gate_;
+};
+
+struct rpc_trace_release_guard {
+  std::shared_ptr<rpc_trace_response_gate> gate;
+  ~rpc_trace_release_guard() { gate->release(); }
+};
+}  // namespace
+
+TEST_CASE("RPC trace is opt-in and reports message sizes and round trip") {
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_capture capture;
+  coro_rpc_server server(1, 0, "127.0.0.1");
+  server.register_handler<rpc_trace_echo>();
+  REQUIRE_FALSE(server.async_start().hasResult());
+  const std::string payload(1024, 'x');
+  for (const char* enabled : std::array<const char*, 3>{nullptr, "0", "1"}) {
+    rpc_trace_env env(enabled);
+    coro_rpc_client client;
+    REQUIRE_FALSE(syncAwait(client.connect(
+        "127.0.0.1", std::to_string(server.port()))));
+    auto result = syncAwait(client.call<rpc_trace_echo>(payload));
+    REQUIRE(result.has_value());
+    CHECK(result.value() == payload);
+    auto lines = capture.records();
+    if (!enabled || std::string_view(enabled) == "0") {
+      CHECK(lines.empty());
+      continue;
+    }
+    REQUIRE(lines.size() == 1);
+    const auto& line = lines.front();
+    CHECK(line.find("transport=TCP addr_kind=tcp local=127.0.0.1:") !=
+          std::string::npos);
+    CHECK(line.find("peer=127.0.0.1:" + std::to_string(server.port())) !=
+          std::string::npos);
+    CHECK(line.find("rpc_trace_echo") != std::string::npos);
+    CHECK(line.find("status=ok") != std::string::npos);
+    CHECK(rpc_trace_number(line, "req_bytes") ==
+          coro_rpc_protocol::REQ_HEAD_LEN +
+              struct_pack::serialize(payload).size());
+    CHECK(rpc_trace_number(line, "resp_bytes") ==
+          coro_rpc_protocol::RESP_HEAD_LEN +
+              struct_pack::serialize(payload).size());
+    CHECK(rpc_trace_number(line, "rtt_us") >= 0);
+  }
+}
+
+TEST_CASE("RPC trace counts request and response attachments") {
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  coro_rpc_server server(1, 0, "127.0.0.1");
+  server.register_handler<echo_with_attachment>();
+  REQUIRE_FALSE(server.async_start().hasResult());
+  coro_rpc_client client;
+  REQUIRE_FALSE(syncAwait(client.connect(
+      "127.0.0.1", std::to_string(server.port()))));
+  const std::string attachment(4096, 'a');
+  auto run = [&]() -> Lazy<void> {
+    auto pending = co_await client.send_request_with_attachment<
+        echo_with_attachment>(attachment);
+    auto response = co_await std::move(pending);
+    REQUIRE(response.has_value());
+    CHECK(response->get_attachment() == attachment);
+  };
+  syncAwait(run());
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 1);
+  CHECK(rpc_trace_number(lines[0], "req_bytes") ==
+        coro_rpc_protocol::REQ_HEAD_LEN + attachment.size());
+  CHECK(rpc_trace_number(lines[0], "resp_bytes") ==
+        coro_rpc_protocol::RESP_HEAD_LEN + attachment.size() +
+            struct_pack::serialize(std::monostate{}).size());
+}
+
+TEST_CASE("RPC trace reports timeout and RPC error exactly once") {
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  coro_rpc_server server(1, 0, "127.0.0.1");
+  server.register_handler<rpc_trace_delayed_echo>();
+  REQUIRE_FALSE(server.async_start().hasResult());
+  {
+    coro_rpc_client client;
+    REQUIRE_FALSE(syncAwait(client.connect(
+        "127.0.0.1", std::to_string(server.port()))));
+    auto result = syncAwait(client.call_for<rpc_trace_delayed_echo>(
+        20ms, std::string("timeout"), 200));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == errc::timed_out);
+  }
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 1);
+  CHECK(lines[0].find("status=timeout") != std::string::npos);
+  CHECK(rpc_trace_number(lines[0], "rtt_us") == -1);
+  CHECK(rpc_trace_number(lines[0], "resp_bytes") == -1);
+  {
+    coro_rpc_client client;
+    REQUIRE_FALSE(syncAwait(client.connect(
+        "127.0.0.1", std::to_string(server.port()))));
+    auto result = syncAwait(client.call<hello>());
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == errc::function_not_registered);
+  }
+  lines = capture.records();
+  REQUIRE(lines.size() == 2);
+  CHECK(lines[1].find("status=rpc_error") != std::string::npos);
+  CHECK(rpc_trace_number(lines[1], "rtt_us") >= 0);
+}
+
+TEST_CASE("RPC trace pairs pipelined out-of-order responses by request ID") {
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  auto gate = std::make_shared<rpc_trace_response_gate>();
+  rpc_trace_ordering_service service(gate);
+  coro_rpc_server server(2, 0, "127.0.0.1");
+  server.register_handler<&rpc_trace_ordering_service::echo>(&service);
+  REQUIRE_FALSE(server.async_start().hasResult());
+  coro_rpc_client client;
+  REQUIRE_FALSE(syncAwait(client.connect(
+      "127.0.0.1", std::to_string(server.port()))));
+  rpc_trace_release_guard release_on_exit{gate};
+  const std::string slow(2048, 's'), fast(32, 'f');
+  auto run = [&]() -> Lazy<void> {
+    auto first = co_await client.send_request<
+        &rpc_trace_ordering_service::echo>(slow, true);
+    auto second = co_await client.send_request<
+        &rpc_trace_ordering_service::echo>(fast, false);
+    auto fast_result = co_await std::move(second);
+    // The gate, not a scheduling delay, enforces the response order. Retain
+    // an independent RTT lower-bound check while the first response is held.
+    co_await coro_io::sleep_for(150ms);
+    gate->release();
+    REQUIRE(fast_result.has_value());
+    CHECK(fast_result->result() == fast);
+    auto slow_result = co_await std::move(first);
+    REQUIRE(slow_result.has_value());
+    CHECK(slow_result->result() == slow);
+  };
+  syncAwait(run());
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 2);
+  const auto slow_id = rpc_trace_number(lines[1], "request_id");
+  CHECK(rpc_trace_number(lines[0], "request_id") == slow_id + 1);
+  CHECK(rpc_trace_number(lines[0], "req_bytes") ==
+        coro_rpc_protocol::REQ_HEAD_LEN +
+            struct_pack::serialize(fast, false).size());
+  CHECK(rpc_trace_number(lines[1], "req_bytes") ==
+        coro_rpc_protocol::REQ_HEAD_LEN +
+            struct_pack::serialize(slow, true).size());
+  CHECK(rpc_trace_number(lines[1], "resp_bytes") ==
+        coro_rpc_protocol::RESP_HEAD_LEN + struct_pack::serialize(slow).size());
+  CHECK(rpc_trace_number(lines[1], "rtt_us") >= 100000);
+}
+
+TEST_CASE("RPC trace refreshes cached endpoints after reconnect") {
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  coro_rpc_server first(1, 0, "127.0.0.1");
+  coro_rpc_server second(1, 0, "127.0.0.1");
+  first.register_handler<rpc_trace_echo>();
+  second.register_handler<rpc_trace_echo>();
+  REQUIRE_FALSE(first.async_start().hasResult());
+  REQUIRE_FALSE(second.async_start().hasResult());
+  REQUIRE(first.port() != second.port());
+  coro_rpc_client client;
+  for (auto port : {first.port(), second.port()}) {
+    REQUIRE_FALSE(syncAwait(client.connect("127.0.0.1", std::to_string(port))));
+    auto result = syncAwait(client.call<rpc_trace_echo>(std::string("reconnect")));
+    REQUIRE(result.has_value());
+    CHECK(result.value() == "reconnect");
+  }
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 2);
+  CHECK(lines[0].find("peer=127.0.0.1:" + std::to_string(first.port()) + " ") !=
+        std::string::npos);
+  CHECK(lines[1].find("peer=127.0.0.1:" + std::to_string(second.port()) + " ") !=
+        std::string::npos);
+}
+
+TEST_CASE("RPC trace does not invent an RTT for a closed connection") {
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  coro_rpc_server server(1, 0, "127.0.0.1");
+  server.register_handler<rpc_trace_echo>();
+  REQUIRE_FALSE(server.async_start().hasResult());
+  coro_rpc_client client;
+  REQUIRE_FALSE(syncAwait(client.connect(
+      "127.0.0.1", std::to_string(server.port()))));
+  client.close();
+  auto result = syncAwait(client.call<rpc_trace_echo>(std::string("closed")));
+  REQUIRE_FALSE(result.has_value());
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 1);
+  CHECK(lines[0].find("local=127.0.0.1:") != std::string::npos);
+  CHECK(lines[0].find("peer=127.0.0.1:" + std::to_string(server.port()) + " ") !=
+        std::string::npos);
+  CHECK(lines[0].find("status=send_error") != std::string::npos);
+  CHECK(rpc_trace_number(lines[0], "rtt_us") == -1);
+  CHECK(rpc_trace_number(lines[0], "resp_bytes") == -1);
+}
+
+TEST_CASE("RPC trace reports an incomplete response as a transport error") {
+  struct reset_injection {
+    ~reset_injection() { g_action = {}; }
+  } reset;
+  g_action = {};
+  rpc_trace_env tcp_only("0", "MC_YLT_URMA_ENABLE");
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  coro_rpc_server server(1, 0, "127.0.0.1");
+  server.register_handler<rpc_trace_echo>();
+  REQUIRE_FALSE(server.async_start().hasResult());
+  coro_rpc_client client;
+  REQUIRE_FALSE(syncAwait(client.connect(
+      "127.0.0.1", std::to_string(server.port()))));
+  g_action = inject_action::close_socket_after_send_length;
+  auto result = syncAwait(client.call<rpc_trace_echo>(std::string("broken")));
+  REQUIRE_FALSE(result.has_value());
+  CHECK(result.error().code == errc::io_error);
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 1);
+  CHECK(lines[0].find("status=transport_error") != std::string::npos);
+  CHECK(rpc_trace_number(lines[0], "rtt_us") == -1);
+  CHECK(rpc_trace_number(lines[0], "resp_bytes") == -1);
+}
+
+#ifdef YLT_ENABLE_URMA
+TEST_CASE("RPC trace reports URMA handshake endpoints" * doctest::skip([] {
+            const char* enabled = std::getenv("MC_YLT_URMA_ENABLE");
+            return !enabled || std::string_view(enabled) != "1";
+          }())) {
+  g_action = {};
+  rpc_trace_env env("1");
+  rpc_trace_capture capture;
+  auto config = coro_io::try_make_urma_rpc_config();
+  // When explicitly enabled, missing hardware is a failure, not a TCP pass.
+  REQUIRE(config.has_value());
+  coro_rpc_server server(1, 0, "127.0.0.1");
+  server.init_urma(*config);
+  server.register_handler<rpc_trace_echo>();
+  REQUIRE_FALSE(server.async_start().hasResult());
+  coro_rpc_client::config client_config;
+  client_config.socket_config = *config;
+  coro_rpc_client client(coro_io::get_global_executor(), client_config);
+  REQUIRE_FALSE(syncAwait(client.connect(
+      "127.0.0.1", std::to_string(server.port()))));
+  const std::string payload(1024, 'u');
+  auto result = syncAwait(client.call<rpc_trace_echo>(payload));
+  REQUIRE(result.has_value());
+  CHECK(result.value() == payload);
+  auto lines = capture.records();
+  REQUIRE(lines.size() == 1);
+  CHECK(lines[0].find(
+            "transport=URMA addr_kind=handshake local=127.0.0.1:") !=
+        std::string::npos);
+  CHECK(lines[0].find("peer=127.0.0.1:" + std::to_string(server.port())) !=
+        std::string::npos);
+  CHECK(rpc_trace_number(lines[0], "req_bytes") ==
+        coro_rpc_protocol::REQ_HEAD_LEN +
+            struct_pack::serialize(payload).size());
+  CHECK(rpc_trace_number(lines[0], "resp_bytes") ==
+        coro_rpc_protocol::RESP_HEAD_LEN +
+            struct_pack::serialize(payload).size());
+  CHECK(rpc_trace_number(lines[0], "rtt_us") >= 0);
+}
+#endif
 
 TEST_CASE("RPC client reapplies configured TCP_NODELAY after connecting") {
   g_action = {};

@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -1184,6 +1185,10 @@ class coro_rpc_client {
   [[nodiscard]] async_simple::coro::Lazy<coro_rpc::err_code> connect_impl(
       Socket &soc, std::chrono::milliseconds conn_timeout_dur,
       std::vector<asio::ip::tcp::endpoint> *eps) {
+    if (control_->trace_rpc_) {
+      std::lock_guard lock(control_->trace_endpoints_mtx_);
+      control_->trace_endpoints_ = {};
+    }
     if (should_reset_) {
       auto reset_ok = co_await reset();
       if (!reset_ok) {
@@ -1268,6 +1273,9 @@ class coro_rpc_client {
                 << " failed to configure TCP_NODELAY: " << ec.message();
       close_socket_async(control_);
       co_return errc::not_connected;
+    }
+    if (control_->trace_rpc_) {
+      control_->cache_trace_endpoints();
     }
     ELOG_INFO << "connect successful, remote addr: "
               << control_->socket_wrapper_.remote_endpoint()
@@ -1499,10 +1507,112 @@ class coro_rpc_client {
 
   struct control_t;
 
+  // Capture live endpoints only when a connection becomes ready. Request
+  // diagnostics copy the cache, never inspecting a concurrently closing socket.
+  struct rpc_trace_endpoints_t {
+    const char *transport_ = "OTHER";
+    const char *addr_kind_ = "transport_endpoint";
+    std::string local_ = "unknown", peer_ = "unknown";
+    template <typename Socket>
+    void set_endpoints(coro_io::socket_wrapper_t &wrapper) noexcept {
+      if constexpr (std::is_same_v<Socket, asio::ip::tcp::socket>) {
+        transport_ = "TCP";
+        addr_kind_ = "tcp";
+      }
+#ifdef YLT_ENABLE_SSL
+      else if constexpr (std::is_same_v<
+                             Socket, asio::ssl::stream<asio::ip::tcp::socket &>>) {
+        transport_ = "TCP_TLS";
+        addr_kind_ = "tcp";
+      }
+#endif
+#ifdef YLT_ENABLE_URMA
+      else if constexpr (std::is_same_v<Socket, coro_io::urma_socket_t>) {
+        transport_ = "URMA";
+        addr_kind_ = "handshake";
+      }
+#endif
+      try {
+        auto format = [](const coro_io::endpoint &ep) {
+          std::ostringstream out;
+          if (ep.address.is_v6()) {
+            out << '[' << ep.address.to_string() << ']';
+          }
+          else {
+            out << ep.address.to_string();
+          }
+          out << ':' << ep.port;
+          return out.str();
+        };
+        local_ = format(wrapper.local_endpoint());
+        peer_ = format(wrapper.remote_endpoint());
+      }
+      catch (...) {
+        // A closing connection must not turn address lookup into an RPC error.
+      }
+    }
+  };
+
+  // Opt-in diagnostics only. Sizes describe RPC messages, not network packets.
+  // Each request owns its state, including when responses arrive out of order.
+  struct rpc_trace_t {
+    using clock = std::chrono::steady_clock;
+    std::mutex mutex_;
+    uint64_t client_id_;
+    uint32_t request_id_;
+    std::string_view rpc_;
+    const rpc_trace_endpoints_t endpoints_;
+    int64_t req_bytes_ = -1;
+    clock::time_point send_start_{};
+    bool started_ = false;
+    bool finished_ = false;
+
+    rpc_trace_t(uint64_t client_id, uint32_t request_id, std::string_view rpc,
+                rpc_trace_endpoints_t endpoints)
+        : client_id_(client_id),
+          request_id_(request_id),
+          rpc_(rpc),
+          endpoints_(std::move(endpoints)) {}
+
+    void set_request_size(std::size_t bytes) {
+      std::lock_guard lock(mutex_);
+      req_bytes_ = static_cast<int64_t>(bytes);
+    }
+
+    void start() {
+      std::lock_guard lock(mutex_);
+      send_start_ = clock::now();
+      started_ = true;
+    }
+
+    void finish(clock::time_point end, int64_t resp_bytes, const char *status,
+                uint16_t error_code) {
+      std::lock_guard lock(mutex_);
+      if (finished_)
+        return;
+      finished_ = true;
+      // No complete response (or no send) means there is no measured RTT.
+      const double rtt_us = started_ && resp_bytes >= 0
+                                ? std::chrono::duration<double, std::micro>(
+                                      end - send_start_)
+                                      .count()
+                                : -1.0;
+      ELOG_INFO << "ylt_rpc transport=" << endpoints_.transport_
+                << " addr_kind=" << endpoints_.addr_kind_
+                << " local=" << endpoints_.local_
+                << " peer=" << endpoints_.peer_ << " client_id=" << client_id_
+                << " request_id=" << request_id_ << " rpc=\"" << rpc_
+                << "\" req_bytes=" << req_bytes_
+                << " resp_bytes=" << resp_bytes << " rtt_us=" << rtt_us
+                << " status=" << status << " error_code=" << error_code;
+    }
+  };
+
   struct handler_t {
     std::unique_ptr<coro_io::period_timer> timer_;
     async_simple::Promise<async_rpc_raw_result> promise_;
     coro_io::data_view response_attachment_buffer_;
+    std::unique_ptr<rpc_trace_t> trace_;
     handler_t(std::unique_ptr<coro_io::period_timer> &&timer,
               async_simple::Promise<async_rpc_raw_result> &&promise,
               coro_io::data_view buffer = {})
@@ -1511,10 +1621,15 @@ class coro_rpc_client {
           response_attachment_buffer_(buffer) {}
     coro_io::data_view &get_buffer() { return response_attachment_buffer_; }
     coro_io::period_timer &timer() { return *timer_; }
-    void operator()(resp_body &&buffer, uint8_t rpc_errc) {
+    void operator()(resp_body &&buffer, uint8_t rpc_errc, int64_t resp_bytes,
+                    rpc_trace_t::clock::time_point receive_end) {
       if (completed_.exchange(true, std::memory_order_acq_rel))
         return;
       timer_->cancel();
+      if (trace_) {
+        trace_->finish(receive_end, resp_bytes,
+                       rpc_errc ? "rpc_error" : "ok", rpc_errc);
+      }
       promise_.setValue(async_rpc_raw_result{async_rpc_raw_result_value_type{
           std::move(buffer), response_attachment_buffer_, rpc_errc}});
     }
@@ -1522,6 +1637,14 @@ class coro_rpc_client {
       if (completed_.exchange(true, std::memory_order_acq_rel))
         return;
       timer_->cancel();
+      if (trace_) {
+        const bool timeout = ec == std::errc::timed_out ||
+                             ec == std::errc::operation_canceled;
+        trace_->finish(rpc_trace_t::clock::now(), -1,
+                       timeout ? "timeout" : "transport_error",
+                       static_cast<uint16_t>(timeout ? errc::timed_out
+                                                     : errc::io_error));
+      }
       promise_.setValue(async_rpc_raw_result{ec});
     }
 
@@ -1546,6 +1669,37 @@ class coro_rpc_client {
     // Copied from config, so they are 0 (unlimited) unless the client opts in.
     uint64_t max_response_body_bytes = 0;
     uint64_t max_response_attachment_bytes = 0;
+    // Keep the socket guard separate: URMA close may resume RPC continuations
+    // inline, and those continuations may read the endpoint cache again.
+    std::mutex trace_socket_mtx_;
+    std::mutex trace_endpoints_mtx_;
+    rpc_trace_endpoints_t trace_endpoints_;
+    // Read once per client. Set YLT_RPC_TRACE=1 before constructing clients.
+    const bool trace_rpc_ = [] {
+      const char *value = std::getenv("YLT_RPC_TRACE");
+      return value && std::string_view(value) == "1";
+    }();
+    void cache_trace_endpoints() {
+      std::lock_guard socket_lock(trace_socket_mtx_);
+      if (has_closed_)
+        return;
+      rpc_trace_endpoints_t snapshot;
+      socket_wrapper_.visit([&](auto &socket) {
+        snapshot.template set_endpoints<
+            std::remove_reference_t<decltype(socket)>>(socket_wrapper_);
+      });
+      std::lock_guard cache_lock(trace_endpoints_mtx_);
+      trace_endpoints_ = std::move(snapshot);
+    }
+    void close_socket_with_trace_guard() {
+      if (trace_rpc_) {
+        std::lock_guard lock(trace_socket_mtx_);
+        socket_wrapper_.close();
+      }
+      else {
+        socket_wrapper_.close();
+      }
+    }
     control_t(coro_io::ExecutorWrapper<> *executor, bool is_timeout,
               const std::string &local_ip)
         : is_timeout_(is_timeout),
@@ -1564,7 +1718,7 @@ class coro_rpc_client {
     ELOG_DEBUG << "client_id " << control->client_id << " close";
     asio::dispatch(control->socket_wrapper_.get_executor()->get_asio_executor(),
                    [control]() {
-                     control->socket_wrapper_.close();
+                     control->close_socket_with_trace_guard();
                    });
     return;
   }
@@ -1582,7 +1736,7 @@ class coro_rpc_client {
     }
     co_await coro_io::post(
         [control = control.get()]() {
-          control->socket_wrapper_.close();
+          control->close_socket_with_trace_guard();
         },
         control->executor_);
     co_return;
@@ -1611,7 +1765,7 @@ class coro_rpc_client {
   template <auto func, typename Socket, typename... Args>
   async_simple::coro::Lazy<rpc_error> send_request_for_impl(
       Socket &soc, request_config_t &config, uint32_t &id,
-      coro_io::period_timer &timer, Args &&...args) {
+      coro_io::period_timer &timer, rpc_trace_t *trace, Args &&...args) {
     if (control_->has_closed_)
       AS_UNLIKELY {
         ELOG_ERROR << "client has been closed, please re-connect"
@@ -1636,7 +1790,7 @@ class coro_rpc_client {
           });
     }
     co_return co_await send_impl<func>(
-        soc, id,
+        soc, id, trace,
         coro_io::data_view{config.request_attachment,
                            config.request_attachment_gpu_id},
         std::forward<Args>(args)...);
@@ -1779,6 +1933,8 @@ class coro_rpc_client {
           ret = co_await coro_io::async_read(socket, iov);
         }
       }
+      const auto receive_end = handler->trace_ ? rpc_trace_t::clock::now()
+                                             : rpc_trace_t::clock::time_point{};
       auto cost_time = (std::chrono::steady_clock::now() - tp) /
                        std::chrono::microseconds(1);
       if (ret.first) {
@@ -1800,7 +1956,10 @@ class coro_rpc_client {
       ELOG_DEBUG << "recv rpc response, cost time = " << cost_time
                  << "us, request ID: " << header.seq_num
                  << ", client_id: " << controller->client_id;
-      (*handler)(std::move(controller->resp_buffer_), header.err_code);
+      const auto resp_bytes = int64_t{coro_rpc_protocol::RESP_HEAD_LEN} +
+                              header.length + header.attach_length;
+      (*handler)(std::move(controller->resp_buffer_), header.err_code,
+                 resp_bytes, receive_end);
       bool has_handlers = false;
       {
         std::lock_guard lock(controller->response_handler_mtx_);
@@ -1953,18 +2112,30 @@ class coro_rpc_client {
         std::move(timer), std::move(promise),
         coro_io::data_view{config.resp_attachment_buf,
                            config.resp_attachment_buf_gpu_id});
+    if (control_->trace_rpc_) {
+      std::lock_guard lock(control_->trace_endpoints_mtx_);
+      handler->trace_ = std::make_unique<rpc_trace_t>(
+          config_.client_id, id, get_func_name<func>(),
+          control_->trace_endpoints_);
+    }
     bool is_ok = false;
     {
       std::lock_guard lock(control_->response_handler_mtx_);
       is_ok = control_->response_handler_table_.try_emplace(id, handler).second;
     }
     if (!is_ok) [[unlikely]] {
+      if (handler->trace_) {
+        handler->trace_->finish(
+            rpc_trace_t::clock::now(), -1, "send_error",
+            static_cast<uint16_t>(errc::serial_number_conflict));
+      }
       close();
       co_return build_failed_rpc_result<rpc_return_t>(
           rpc_error{coro_rpc::errc::serial_number_conflict});
     }
     auto result = co_await control_->socket_wrapper_.visit([&](auto &socket) {
       return send_request_for_impl<func>(socket, config, id, handler->timer(),
+                                         handler->trace_.get(),
                                          std::forward<Args>(args)...);
     });
     if (result) {
@@ -1974,6 +2145,12 @@ class coro_rpc_client {
       }
       if (handler) {
         handler->timer().cancel();
+        if (handler->trace_) {
+          handler->trace_->finish(
+              rpc_trace_t::clock::now(), -1,
+              result.code == errc::timed_out ? "timeout" : "send_error",
+              result.code.val());
+        }
       }
       co_return build_failed_rpc_result<rpc_return_t>(std::move(result));
     }
@@ -1996,12 +2173,16 @@ class coro_rpc_client {
  private:
   template <auto func, typename Socket, typename... Args>
   async_simple::coro::Lazy<rpc_error> send_impl(
-      Socket &socket, uint32_t &id, coro_io::data_view req_attachment,
+      Socket &socket, uint32_t &id, rpc_trace_t *trace,
+      coro_io::data_view req_attachment,
       Args &&...args) {
     auto buffer = prepare_buffer<func>(id, req_attachment.size(),
                                        std::forward<Args>(args)...);
     if (buffer.empty()) {
       co_return rpc_error{errc::message_too_large};
+    }
+    if (trace) {
+      trace->set_request_size(buffer.size() + req_attachment.size());
     }
 #ifdef GENERATE_BENCHMARK_DATA
     control_->func_name_ = get_func_name<func>();
@@ -2085,6 +2266,10 @@ class coro_rpc_client {
         }
       }
 #endif
+      // Exclude serialization, write-lock contention and URMA send-window wait.
+      if (trace) {
+        trace->start();
+      }
       if (req_attachment.empty()) {
         ret = co_await coro_io::async_write(
             socket, asio::buffer(buffer.data(), buffer.size()));

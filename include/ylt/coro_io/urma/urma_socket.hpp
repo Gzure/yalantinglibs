@@ -34,6 +34,8 @@
 #include <system_error>
 #include <utility>
 
+#include "ylt/coro_io/urma/urma_priority.hpp"
+
 #include "asio/dispatch.hpp"
 #include "asio/ip/address.hpp"
 #include "asio/ip/tcp.hpp"
@@ -184,15 +186,35 @@ struct urma_socket_shared_state_t
     const auto& cap = device_->attr().dev_cap;
     auto priority = get_priority(device_->attr(), jfs_priority, tp_type);
     if (!priority) {
-      ELOG_ERROR << "URMA device has no priority supporting transport type "
-                 << static_cast<unsigned>(tp_type);
+      ELOG_ERROR << "URMA priority selection failed: requested_priority="
+                 << static_cast<unsigned>(jfs_priority)
+                 << ", effective_priority=none, tp_type="
+                 << static_cast<unsigned>(tp_type)
+                 << ", trans_mode=RM, device_name=" << device_->name();
       return false;
     }
+    bool capability_reported = false;
+    for (const auto& info : cap.priority_info)
+      capability_reported |= info.tp_type.value != 0;
+    ELOG_INFO << "URMA priority selection: requested_priority="
+              << static_cast<unsigned>(jfs_priority)
+              << ", effective_priority=" << static_cast<unsigned>(*priority)
+              << ", tp_type=" << static_cast<unsigned>(tp_type)
+              << ", trans_mode=RM, device_name=" << device_->name()
+              << ", fallback=" << (*priority != jfs_priority)
+              << ", capability_reported=" << capability_reported
+              << ", SL=" << cap.priority_info[*priority].SL;
+    if (!capability_reported) {
+      ELOG_WARN << "URMA priority capability unknown: device_name="
+                << device_->name() << "; requested priority is unverified";
+    }
     if (*priority != jfs_priority) {
-      ELOG_WARN << "URMA priority " << static_cast<unsigned>(jfs_priority)
-                << " does not support transport type "
-                << static_cast<unsigned>(tp_type) << "; use priority "
-                << static_cast<unsigned>(*priority);
+      ELOG_WARN << "URMA priority fallback: requested_priority="
+                << static_cast<unsigned>(jfs_priority)
+                << ", effective_priority=" << static_cast<unsigned>(*priority)
+                << ", tp_type=" << static_cast<unsigned>(tp_type)
+                << ", trans_mode=RM, device_name=" << device_->name()
+                << ", fallback=true; requested priority is unsupported";
       jfs_priority = *priority;
     }
     ELOG_INFO << "URMA resource init: device=" << device_->name()
@@ -1120,6 +1142,7 @@ class urma_socket_t {
 
  private:
   void init(config_t config) {
+    config.jfs_priority = detail::urma_priority_from_env(config.jfs_priority);
     ELOG_INFO << "URMA socket init requested: device=" << config.device_name
               << ", eid_index=" << config.eid_index
               << ", tp_type=" << static_cast<int>(config.tp_type)

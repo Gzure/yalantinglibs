@@ -136,13 +136,7 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
   urma_rpc_parse_env_integer("MC_YLT_URMA_MAX_MEMORY_USAGE",
                              config.max_memory_usage);
   urma_rpc_parse_env_tp_type(config.tp_type);
-  auto default_priority = config.jfs_priority;
-  urma_rpc_parse_env_integer("MC_YLT_URMA_PRIORITY", config.jfs_priority);
-  if (config.jfs_priority > 15) {
-    ELOG_WARN << "invalid MC_YLT_URMA_PRIORITY value; use default "
-              << static_cast<unsigned>(default_priority);
-    config.jfs_priority = default_priority;
-  }
+  config.jfs_priority = urma_priority_from_env(config.jfs_priority);
   config.event_mode =
       urma_rpc_env_flag("MC_YLT_URMA_EVENT_MODE", /*default*/ true);
   urma_rpc_parse_env_integer("MC_YLT_URMA_BUSY_POLL_BUDGET",
@@ -206,7 +200,8 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
               << ", send_buffer_cnt=" << config.send_buffer_cnt
               << ", buffer_size=" << config.buffer_size
               << ", max_memory_usage=" << config.max_memory_usage
-              << ", jfs_priority=" << static_cast<unsigned>(config.jfs_priority)
+              << ", requested_priority="
+              << static_cast<unsigned>(config.jfs_priority)
               << ", event_mode=" << (config.event_mode ? "on" : "off")
               << ", busy_poll_budget=" << config.busy_poll_budget
               << ", pending_poll_budget=" << config.pending_poll_budget

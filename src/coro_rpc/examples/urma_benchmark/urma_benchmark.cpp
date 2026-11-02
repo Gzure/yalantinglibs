@@ -108,18 +108,18 @@ void set_process_env(const char* name, const std::string& value) {
 }
 
 void configure_urma_rpc_env(const options_t& opt) {
-  set_process_env("URMA_RPC_ENABLE", "1");
-  set_process_env("URMA_RPC_DEVICE", opt.device);
-  set_process_env("URMA_RPC_EID_INDEX", std::to_string(opt.eid_index));
-  set_process_env("URMA_RPC_CQ_SIZE", std::to_string(opt.queue_depth * 2 + 8));
-  set_process_env("URMA_RPC_RECV_BUFFER_CNT", std::to_string(opt.queue_depth));
-  set_process_env("URMA_RPC_SEND_BUFFER_CNT", std::to_string(opt.queue_depth));
-  set_process_env("URMA_RPC_BUFFER_SIZE", std::to_string(opt.buffer_size));
-  set_process_env("URMA_RPC_MAX_MEMORY_USAGE",
+  set_process_env("MC_YLT_URMA_ENABLE", "1");
+  set_process_env("MC_YLT_URMA_DEVICE", opt.device);
+  set_process_env("MC_YLT_URMA_EID_INDEX", std::to_string(opt.eid_index));
+  set_process_env("MC_YLT_URMA_CQ_SIZE", std::to_string(opt.queue_depth * 2 + 8));
+  set_process_env("MC_YLT_URMA_RECV_BUFFER_CNT", std::to_string(opt.queue_depth));
+  set_process_env("MC_YLT_URMA_SEND_BUFFER_CNT", std::to_string(opt.queue_depth));
+  set_process_env("MC_YLT_URMA_BUFFER_SIZE", std::to_string(opt.buffer_size));
+  set_process_env("MC_YLT_URMA_MAX_MEMORY_USAGE",
                   std::to_string(effective_pool_memory_usage(opt)));
-  set_process_env("URMA_RPC_TP_TYPE", "ctp");
-  set_process_env("URMA_RPC_PRIORITY", std::to_string(opt.priority));
-  set_process_env("URMA_RPC_EVENT_MODE", opt.event_mode);
+  set_process_env("MC_YLT_URMA_TP_TYPE", "ctp");
+  set_process_env("MC_YLT_URMA_PRIORITY", std::to_string(opt.priority));
+  set_process_env("MC_YLT_URMA_EVENT_MODE", opt.event_mode);
 }
 
 void print_usage(const char* program) {
@@ -139,7 +139,8 @@ void print_usage(const char* program) {
       << "  --buffer-size <bytes>    URMA SEND chunk size. Default 4096 for "
          "CTP\n"
       << "  --queue-depth <n>        URMA send/recv queue depth. Default 64\n"
-      << "  --priority <n>          URMA JFS priority. Default 15\n"
+      << "  --priority <n>          URMA JFS priority. Default 15; "
+         "MC_YLT_URMA_PRIORITY overrides\n"
       << "  --max-memory-mib <n>     URMA buffer pool memory per process. "
          "Default 256, auto-raised when needed\n"
       << "  --no-urma               Use TCP instead of URMA RPC. Default URMA\n"
@@ -347,6 +348,8 @@ options_t parse_options(int argc, char** argv) {
   if (opt.role == "server" && !host_was_set) {
     opt.host = "0.0.0.0";
   }
+  if (opt.use_urma || opt.transport == "raw")
+    opt.priority = coro_io::detail::urma_priority_from_env(opt.priority);
   return opt;
 }
 

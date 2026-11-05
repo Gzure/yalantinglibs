@@ -147,6 +147,31 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
       urma_rpc_env_flag("URMA_RPC_EVENT_MODE", /*default*/ true);
   urma_rpc_parse_env_integer("URMA_RPC_BUSY_POLL_BUDGET",
                              config.busy_poll_budget);
+  urma_rpc_parse_env_integer("URMA_RPC_PENDING_POLL_BUDGET",
+                             config.pending_poll_budget);
+  urma_rpc_parse_env_integer("URMA_RPC_JFC_MODERATE_COUNT",
+                             config.jfc_moderate_count);
+  urma_rpc_parse_env_integer("URMA_RPC_JFC_MODERATE_PERIOD",
+                             config.jfc_moderate_period);
+  constexpr std::size_t max_pending_poll_budget = 4096;
+  if (config.pending_poll_budget > max_pending_poll_budget) {
+    ELOG_WARN << "URMA_RPC_PENDING_POLL_BUDGET=" << config.pending_poll_budget
+              << " is too large; clamped to " << max_pending_poll_budget
+              << " (the reactor thread would otherwise spin for too long)";
+    config.pending_poll_budget = max_pending_poll_budget;
+  }
+  if (config.jfc_moderate_count <= 0 || config.jfc_moderate_count > 0xFFFF) {
+    ELOG_WARN << "invalid URMA_RPC_JFC_MODERATE_COUNT value: "
+              << config.jfc_moderate_count
+              << "; CQ event moderation count kept as driver default";
+    config.jfc_moderate_count = -1;
+  }
+  if (config.jfc_moderate_period > 0xFFFF) {
+    ELOG_WARN << "invalid URMA_RPC_JFC_MODERATE_PERIOD value: "
+              << config.jfc_moderate_period
+              << "; CQ event moderation period kept as driver default";
+    config.jfc_moderate_period = -1;
+  }
   {
     uint64_t interval_us = 5;
     urma_rpc_parse_env_integer("URMA_RPC_POLL_INTERVAL", interval_us);
@@ -182,7 +207,10 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
               << ", max_memory_usage=" << config.max_memory_usage
               << ", jfs_priority=" << static_cast<unsigned>(config.jfs_priority)
               << ", event_mode=" << (config.event_mode ? "on" : "off")
-              << ", busy_poll_budget=" << config.busy_poll_budget;
+              << ", busy_poll_budget=" << config.busy_poll_budget
+              << ", pending_poll_budget=" << config.pending_poll_budget
+              << ", jfc_moderate_count=" << config.jfc_moderate_count
+              << ", jfc_moderate_period=" << config.jfc_moderate_period;
     return config;
   } catch (const std::exception& e) {
     ELOG_WARN << "URMA RPC auto enable failed: " << e.what()

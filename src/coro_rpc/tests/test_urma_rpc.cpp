@@ -195,6 +195,77 @@ TEST_CASE("urma rpc env event mode defaults to on and can be overridden") {
   }
 }
 
+TEST_CASE("urma rpc env pending poll budget and jfc moderation") {
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // A productive event must not be followed by extra polling: the jfce fd
+    // already signalled. 1 leaves headroom for a CQE that lands between the
+    // last drain and the rearm.
+    CHECK(config.pending_poll_budget == 1);
+    // Event wake-up latency is bounded by CQ event moderation, so the default
+    // asks for one event per CQE and leaves the period to the driver.
+    CHECK(config.jfc_moderate_count == 1);
+    CHECK(config.jfc_moderate_period == -1);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var pending("URMA_RPC_PENDING_POLL_BUDGET", "8");
+    scoped_env_var count("URMA_RPC_JFC_MODERATE_COUNT", "-1");
+    scoped_env_var period("URMA_RPC_JFC_MODERATE_PERIOD", "50");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.pending_poll_budget == 8);
+    CHECK(config.jfc_moderate_count == -1);
+    CHECK(config.jfc_moderate_period == 50);
+  }
+  {
+    // count=-1 and period=-1 is the A/B control arm: urma_modify_jfc is skipped
+    // entirely and the driver default moderation applies.
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var count("URMA_RPC_JFC_MODERATE_COUNT", "-1");
+    scoped_env_var period("URMA_RPC_JFC_MODERATE_PERIOD", "-1");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.jfc_moderate_count == -1);
+    CHECK(config.jfc_moderate_period == -1);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var count("URMA_RPC_JFC_MODERATE_COUNT", "70000");
+    scoped_env_var period("URMA_RPC_JFC_MODERATE_PERIOD", "70000");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // Out of uint16 range: fall back to the driver default instead of failing.
+    CHECK(config.jfc_moderate_count == -1);
+    CHECK(config.jfc_moderate_period == -1);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var count("URMA_RPC_JFC_MODERATE_COUNT", "0");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // 0 is not a meaningful CQ event count: treat it as "driver default".
+    CHECK(config.jfc_moderate_count == -1);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var pending("URMA_RPC_PENDING_POLL_BUDGET", "100000");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // Unbounded spins would hold the reactor thread; clamp instead.
+    CHECK(config.pending_poll_budget == 4096);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var pending("URMA_RPC_PENDING_POLL_BUDGET", "abc");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.pending_poll_budget == 1);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var pending("URMA_RPC_PENDING_POLL_BUDGET", "-5");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // Negative values do not parse into std::size_t: keep the default.
+    CHECK(config.pending_poll_budget == 1);
+  }
+}
+
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {
   scoped_env_var enable("URMA_RPC_ENABLE", "0");
 

@@ -99,8 +99,30 @@ if (YLT_ENABLE_URMA)
     if (URMA_BOND_INCLUDE_PATH)
         message(STATUS "Found URMA bonding headers: ${URMA_BOND_INCLUDE_PATH}")
     endif()
+    # JFC event moderation (urma_modify_jfc / urma_jfc_attr_t / JFC_MODERATE_*)
+    # is optional: older UMDK releases ship urma_api.h without it. Probe at
+    # configure time and compile the tuning out when the symbols are missing, so
+    # the default build never depends on a specific UMDK minor version.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${URMA_INCLUDE_PATH} ${URMA_BOND_INCLUDE_PATH})
+    check_cxx_source_compiles("
+        #include <urma_api.h>
+        int main() {
+            urma_jfc_attr_t attr{};
+            attr.mask |= JFC_MODERATE_COUNT;
+            urma_modify_jfc(nullptr, &attr);
+            return 0;
+        }" YLT_URMA_HAS_JFC_MODERATION)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    if (NOT YLT_URMA_HAS_JFC_MODERATION)
+        message(STATUS "URMA headers lack urma_modify_jfc; "
+                       "JFC event moderation is compiled out")
+    endif()
     if(CMAKE_PROJECT_NAME STREQUAL "yaLanTingLibs")
         add_compile_definitions("YLT_ENABLE_URMA")
+        if (NOT YLT_URMA_HAS_JFC_MODERATION)
+            add_compile_definitions("YLT_URMA_NO_JFC_MODERATION")
+        endif()
         include_directories(${URMA_INCLUDE_PATH})
         if (URMA_BOND_INCLUDE_PATH)
             include_directories(${URMA_BOND_INCLUDE_PATH})
@@ -108,6 +130,9 @@ if (YLT_ENABLE_URMA)
         link_libraries(-lurma)
     else ()
         target_compile_definitions(${ylt_target_name} INTERFACE "YLT_ENABLE_URMA")
+        if (NOT YLT_URMA_HAS_JFC_MODERATION)
+            target_compile_definitions(${ylt_target_name} INTERFACE "YLT_URMA_NO_JFC_MODERATION")
+        endif()
         target_include_directories(${ylt_target_name} INTERFACE ${URMA_INCLUDE_PATH})
         if (URMA_BOND_INCLUDE_PATH)
             target_include_directories(${ylt_target_name} INTERFACE ${URMA_BOND_INCLUDE_PATH})

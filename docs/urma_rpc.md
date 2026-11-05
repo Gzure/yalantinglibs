@@ -112,8 +112,16 @@ export URMA_RPC_EID_INDEX=0
 | `URMA_RPC_TP_TYPE` | `ctp`、`rtp` 或其他支持的类型 |
 | `URMA_RPC_PRIORITY` | JFS priority，范围 `0~15`，默认值为 `15` |
 | `URMA_RPC_EVENT_MODE` | JFCE 事件模式开关 |
-| `URMA_RPC_BUSY_POLL_BUDGET` | 事件唤醒后的忙轮询次数 |
-| `URMA_RPC_POLL_INTERVAL` | 轮询间隔，单位微秒 |
+| `URMA_RPC_BUSY_POLL_BUDGET` | 事件唤醒后、**没有在途 send/recv 回调**时的空轮询预算（抓空闲突发），默认 `16`；实际执行 `budget+1` 次空 polling |
+| `URMA_RPC_PENDING_POLL_BUDGET` | 事件唤醒后、**仍有在途 send/recv 回调**时的空轮询预算，默认 `1`（实际 `budget+1` 次）：事件已被 jfce fd 交付，抽干即回到 rearm+wait；保留 1 次是为了覆盖"CQE 落在最后一次抽干与 rearm 之间"的窗口。设为 `0` 用于极限压测 |
+| `URMA_RPC_JFC_MODERATE_COUNT` / `URMA_RPC_JFC_MODERATE_PERIOD` | JFC 完成事件合并参数（`urma_modify_jfc`），默认 `1` / `-1`：`count=1` 让每个 CQE 立刻产生事件，`period` 保留驱动默认。驱动默认合并会把 JFCE 唤醒延迟抬到 `moderate_period` 量级（实测 50~300µs），对 13~20µs RTT 目标是致命的；任一字段设 `-1` 表示该字段沿用驱动默认（A/B 对照）。**吞吐提示**：`count=1` 下 jfce 事件数随 CQE 线性增长，极高吞吐场景可改用 `count=16`/`period=10` 或 `-1`/`-1` |
+| `URMA_RPC_POLL_INTERVAL` | timer 兜底路径的轮询间隔，单位微秒 |
+
+事件模式的延迟取决于 **JFCE 唤醒延迟**，而不是轮询预算。若事件模式时延仍偏高，按下面顺序排查：
+
+1. 看启动日志 `URMA JFC event moderation applied: count=..., period_us=...`；出现 `urma_modify_jfc failed` 说明驱动不接受该参数（此时功能自动退回驱动默认，不影响正确性）。
+2. 用 `URMA_RPC_JFC_MODERATE_COUNT=-1 URMA_RPC_JFC_MODERATE_PERIOD=-1` 跑一组对照，确认延迟差异是否来自合并。
+3. 若目标 UMDK 版本没有 `urma_modify_jfc` / `urma_jfc_attr_t`，cmake 的 `check_cxx_source_compiles` 探测会自动定义 `YLT_URMA_NO_JFC_MODERATION` 把这段编译掉；也可以手工强制关闭（**定义宏时不要带值**，写成 `-DYLT_URMA_NO_JFC_MODERATION` 而不是 `=0`）。
 
 实现位于 `include/ylt/coro_io/urma/urma_rpc_env.hpp`，行为测试位于 `src/coro_rpc/tests/test_urma_rpc.cpp`。
 

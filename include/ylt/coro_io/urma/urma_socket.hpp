@@ -75,6 +75,11 @@ inline std::error_code make_urma_error(int status) {
   return std::error_code(std::abs(status), std::generic_category());
 }
 
+// Linux kernel-internal errno surfaced by the URMA wait path; glibc does not
+// define it (urma_api.h documents it as "ERESTARTSYS(512)" and requires callers
+// to retry the wait instead of treating it as an error).
+inline constexpr int kUrmaErestartsys = 512;
+
 struct urma_deleter {
   void operator()(urma_jfc_t* value) const {
     if (value)
@@ -513,11 +518,64 @@ struct urma_socket_shared_state_t
     return true;
   }
 
-  // Event-driven completion loop: rearm -> wait -> ack -> poll drain -> rearm.
-  // After an event wakeup, spin briefly (poll without sleeping) to catch the
-  // burst of completions that typically follow, avoiding repeated event
-  // wakeup latency under request/response workloads.  Only when the spin
-  // budget is exhausted without new completions do we rearm and sleep.
+  // Tune CQ event moderation for the event-driven path. Must run only after
+  // init_event_fd() succeeded: a socket that falls back to the timer poller
+  // never rearms/acks its jfce, so asking the driver for one event per CQE
+  // there would only accumulate events nobody consumes.
+  //
+  // With the driver default the jfce fires after moderate_count CQEs or
+  // moderate_period microseconds, which is the 50-300us wake-up latency that
+  // makes the event loop unusable for a 13-20us RTT target. A field set to -1
+  // keeps that part of the driver default (A/B control arm).
+  //
+  // YLT_URMA_NO_JFC_MODERATION (defined without a value) compiles this out for
+  // UMDK releases that predate urma_modify_jfc/urma_jfc_attr_t; cmake probes
+  // for those symbols and defines the macro automatically when missing.
+  void apply_jfc_moderation() {
+    if (!event_mode_enabled_)
+      return;
+    if (jfc_moderate_count_ < 0 && jfc_moderate_period_ < 0)
+      return;
+#ifndef YLT_URMA_NO_JFC_MODERATION
+    urma_jfc_attr_t attr{};
+    if (jfc_moderate_count_ >= 0) {
+      attr.mask |= JFC_MODERATE_COUNT;
+      attr.moderate_count =
+          static_cast<uint16_t>(std::min(jfc_moderate_count_, 0xFFFF));
+    }
+    if (jfc_moderate_period_ >= 0) {
+      attr.mask |= JFC_MODERATE_PERIOD;
+      attr.moderate_period =
+          static_cast<uint16_t>(std::min(jfc_moderate_period_, 0xFFFF));
+    }
+    errno = 0;
+    if (urma_modify_jfc(jfc_.get(), &attr) != URMA_SUCCESS) {
+      ELOG_WARN << "urma_modify_jfc failed: errno=" << errno
+                << ", moderate_count=" << jfc_moderate_count_
+                << ", moderate_period_us=" << jfc_moderate_period_
+                << "; keep driver default CQ moderation";
+    }
+    else {
+      ELOG_INFO << "URMA JFC event moderation applied: count="
+                << jfc_moderate_count_
+                << ", period_us=" << jfc_moderate_period_;
+    }
+#else
+    static std::atomic_bool moderation_warned{false};
+    bool expected = false;
+    if (moderation_warned.compare_exchange_strong(expected, true)) {
+      ELOG_WARN << "URMA JFC event moderation tuning is compiled out "
+                   "(YLT_URMA_NO_JFC_MODERATION); driver default applies";
+    }
+#endif
+  }
+
+  // Event-driven completion loop: rearm -> wait -> ack -> drain -> rearm.
+  // After the jfce fd wakes us up, the only work left is to drain the CQEs of
+  // that event: polling more cannot discover a completion earlier than the fd
+  // would have, it only holds this reactor thread, so the default is to drain
+  // to empty and go straight back to rearm+wait. Bursts are drained in bounded
+  // rounds so a pipelined peer cannot monopolize the thread.
   async_simple::coro::Lazy<void> event_loop() {
     auto self = shared_from_this();
     std::error_code ec;
@@ -561,42 +619,67 @@ struct urma_socket_shared_state_t
         break;
       }
       urma_jfc_t* ev_jfc = nullptr;
+      // time_out == 0 is a non-blocking "collect the event that woke the fd".
+      errno = 0;
       int ev_cnt = urma_wait_jfc(jfce_.get(), 1, 0, &ev_jfc);
+      if (ev_cnt == 0 && errno == kUrmaErestartsys) {
+        // Vendor contract: a signal-interrupted wait must be retried, and the
+        // event must not be acked (it was not consumed). One non-blocking retry
+        // is enough here: the jfce fd is already readable, so either the event
+        // is available now or the driver has nothing to hand us.
+        errno = 0;
+        ev_cnt = urma_wait_jfc(jfce_.get(), 1, 0, &ev_jfc);
+      }
       if (ev_cnt > 0 && ev_jfc) {
         uint32_t ack_cnt = 1;
         urma_ack_jfc(&ev_jfc, &ack_cnt, 1);
       }
-      // Drain all completions from this event, then decide:
-      // - If there are pending callbacks (send/recv waiting), skip spin and
-      //   go straight to rearm+sleep so other event_loop coroutines (and
-      //   the resumed callback coroutines) get CPU time.  This prevents
-      //   a short spin (4 polls) to catch an imminent CQE, then sleep.
-      // - If no pending callbacks, spin up to busy_poll_budget_ to catch a
-      //   burst of idle traffic.
-      bool has_pending = !send_callbacks_.empty() || recv_callback_;
+      else if (ev_cnt < 0) {
+        ELOG_WARN << "urma_wait_jfc failed: errno=" << errno
+                  << ", falling back to draining the jfc";
+      }
+      else {
+        ELOG_DEBUG << "urma_wait_jfc reported no event after fd readiness: "
+                      "errno="
+                   << errno << "; draining the jfc anyway";
+      }
+      // The jfce fd already woke this coroutine; all that is left is to drain
+      // the CQEs of that event. Spinning here cannot discover a completion any
+      // earlier than the fd would have, but it does hold this reactor thread,
+      // so the default is: drain to empty, then go straight back to
+      // rearm+wait. pending_poll_budget_ > 0 is only for burst-catching
+      // experiments. The budget is re-evaluated every iteration because
+      // resumed callbacks can post new sends/recvs.
       std::size_t idle_spins = 0;
-      std::size_t pending_budget = has_pending ? 64 : busy_poll_budget_;
+      std::size_t drain_rounds = 0;
+      bool delivered_any = false;
       while (!has_close_) {
+        const bool has_pending = !send_callbacks_.empty() || recv_callback_;
         auto [poll_ec, n] = poll_completion();
         if (poll_ec) {
           fail_pending(poll_ec);
           close();
           goto loop_end;
         }
-        if (n == 0) {
-          if (++idle_spins >= pending_budget)
+        if (n > 0) {
+          delivered_any = true;
+          idle_spins = 0;
+          // Bounded drain: on a pipelined peer the CQ can stay non-empty
+          // indefinitely; stop after kMaxDrainRounds and let the io_context run
+          // other ready handlers. Remaining CQEs stay queued and the next rearm
+          // fires an event immediately.
+          if (++drain_rounds >= kMaxDrainRounds)
             break;
           continue;
         }
-        idle_spins = 0;
-        // After poll_completion resumes callbacks, has_pending may now be true
-        // (new sends/recvs posted by the resumed coroutines).  Re-check and
-        // switch to the shorter pending budget so we don't spin too long.
-        bool now_pending = !send_callbacks_.empty() || recv_callback_;
-        if (now_pending && !has_pending) {
-          has_pending = true;
-          pending_budget = 4;
-        }
+        // A productive event (>=1 CQE delivered) needs no further polling: the
+        // fd already fired and its burst was drained above. Only a wake-up that
+        // delivered nothing spends the idle budget chasing a trailing burst.
+        const std::size_t spin_budget =
+            has_pending ? pending_poll_budget_
+                        : (delivered_any ? 0 : busy_poll_budget_);
+        if (++idle_spins > spin_budget)
+          break;
       }
     }
   loop_end:;
@@ -604,7 +687,17 @@ struct urma_socket_shared_state_t
 
   // Start the completion watcher; event-driven loop or legacy busy poll.
   void start_completion_watch() {
-    if (event_mode_enabled_ && init_event_fd()) {
+    // init_event_fd() has side effects (it may disable event mode), so decide
+    // once and log the mode that is actually going to run.
+    const bool use_event = event_mode_enabled_ && init_event_fd();
+    ELOG_INFO << "URMA completion detection: mode="
+              << (use_event ? "event" : "timer-poll")
+              << ", pending_poll_budget=" << pending_poll_budget_
+              << ", idle_busy_poll_budget=" << busy_poll_budget_
+              << ", idle_poll_interval_us=" << idle_poll_interval_.count();
+    if (use_event) {
+      // Tune moderation only once the jfce is actually consumed by this loop.
+      apply_jfc_moderation();
       ELOG_INFO << "URMA starting event-driven completion loop (jfce fd="
                 << jfce_->fd << ")";
       auto self = shared_from_this();
@@ -705,8 +798,13 @@ struct urma_socket_shared_state_t
   bool peer_close_ = false;
   bool event_mode_enabled_ = false;
   std::size_t busy_poll_budget_ = 16;
+  std::size_t pending_poll_budget_ = 1;
+  int jfc_moderate_count_ = 1;
+  int jfc_moderate_period_ = -1;
   std::chrono::microseconds idle_poll_interval_{5};
   static constexpr std::size_t max_active_poll_budget_ = 64;
+  // Upper bound on consecutive non-empty drain rounds per jfce event.
+  static constexpr std::size_t kMaxDrainRounds = 64;
   std::size_t active_poll_budget_ = max_active_poll_budget_;
   std::string init_stage_;
   std::error_code init_error_;
@@ -728,6 +826,23 @@ class urma_socket_t {
     uint8_t jfs_priority = 15;
     bool event_mode = true;
     std::size_t busy_poll_budget = 16;
+    // Event mode only: empty-poll budget spent after a jfce event wake-up while
+    // there are still pending send/recv callbacks. The implementation performs
+    // budget + 1 empty polls, and 0 would still drain the event once. 1 is the
+    // default: it covers the "CQE lands between the last drain and the rearm"
+    // window at ~0.1us of CPU. Raise it only for burst-catching experiments; it
+    // cannot lower completion latency because the jfce fd already signalled.
+    std::size_t pending_poll_budget = 1;
+    // JFC completion-event moderation (event mode only). A driver default of
+    // moderation batches CQEs and lifts jfce wake-up latency to the
+    // moderate_period scale (measured 50-300us), which swamps a 13-20us RTT
+    // target, so the default asks for one event per CQE (count=1) while leaving
+    // the period to the driver (-1). Set either field to -1 to keep that part
+    // of the driver default (A/B control arm). Throughput note: with count=1
+    // the number of jfce events grows linearly with CQEs; very high-throughput
+    // users can set e.g. count=16/period=10 or -1/-1 to restore batching.
+    int jfc_moderate_count = 1;
+    int jfc_moderate_period = -1;
     std::chrono::microseconds poll_interval{5};
   };
 
@@ -1033,6 +1148,9 @@ class urma_socket_t {
     buffer_size_ = std::min<uint32_t>(conf_.buffer_size,
                                       state_->buffer_pool_->buffer_size());
     state_->busy_poll_budget_ = conf_.busy_poll_budget;
+    state_->pending_poll_budget_ = conf_.pending_poll_budget;
+    state_->jfc_moderate_count_ = conf_.jfc_moderate_count;
+    state_->jfc_moderate_period_ = conf_.jfc_moderate_period;
     state_->idle_poll_interval_ = conf_.poll_interval;
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode,
                       conf_.jfs_priority, conf_.tp_type)) {

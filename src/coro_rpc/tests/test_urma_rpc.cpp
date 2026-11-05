@@ -207,6 +207,21 @@ TEST_CASE("urma rpc env pending poll budget and jfc moderation") {
     // asks for one event per CQE and leaves the period to the driver.
     CHECK(config.jfc_moderate_count == 1);
     CHECK(config.jfc_moderate_period == -1);
+    // Timer-mode fallback polls from the reactor thread instead of arming an
+    // asio timer per tick; URMA_RPC_POLL_SPIN=0 restores the timer cadence.
+    CHECK(config.poll_spin == true);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var spin("URMA_RPC_POLL_SPIN", "0");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.poll_spin == false);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var spin("URMA_RPC_POLL_SPIN", "on");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.poll_spin == true);
   }
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");

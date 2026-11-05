@@ -177,6 +177,7 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
     urma_rpc_parse_env_integer("URMA_RPC_POLL_INTERVAL", interval_us);
     config.poll_interval = std::chrono::microseconds(interval_us);
   }
+  config.poll_spin = urma_rpc_env_flag("URMA_RPC_POLL_SPIN", /*default*/ true);
 
   return config;
 }
@@ -210,7 +211,8 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
               << ", busy_poll_budget=" << config.busy_poll_budget
               << ", pending_poll_budget=" << config.pending_poll_budget
               << ", jfc_moderate_count=" << config.jfc_moderate_count
-              << ", jfc_moderate_period=" << config.jfc_moderate_period;
+              << ", jfc_moderate_period=" << config.jfc_moderate_period
+              << ", timer_poll=" << (config.poll_spin ? "spin" : "timer");
     return config;
   } catch (const std::exception& e) {
     ELOG_WARN << "URMA RPC auto enable failed: " << e.what()

@@ -451,6 +451,7 @@ struct urma_socket_shared_state_t
     return {{}, polled};
   }
 
+  // Timer-mode sleep path (only used when poll_spin_ is false).
   void start_polling() {
     auto self = shared_from_this();
     poll_timer_.expires_after(idle_poll_interval_);
@@ -464,23 +465,35 @@ struct urma_socket_shared_state_t
   void poll_once() {
     if (has_close_)
       return;
-    auto [poll_ec, completion_count] = poll_completion();
-    if (poll_ec) {
-      fail_pending(poll_ec);
-      close();
-      return;
+    // A poll round is a userspace udma_u_poll_jfc, while a timer tick costs two
+    // timerfd_settime plus an epoll wake-up (~3.5us of CPU for 5us of wall
+    // time, per socket). In spin mode keep polling inline for a few rounds and
+    // then yield to the io_context, so the timer machinery stays off the hot
+    // path and completion latency is one poll round. The cost is one busy core
+    // per reactor thread owning a timer-mode socket: bound it with
+    // --rpc_thread_num on the server, or set URMA_RPC_POLL_SPIN=0 to get the
+    // timer cadence back.
+    const std::size_t inline_rounds = poll_spin_ ? kPollInlineBatch : 1;
+    for (std::size_t round = 0; round < inline_rounds; ++round) {
+      if (has_close_)
+        return;
+      auto [poll_ec, completion_count] = poll_completion();
+      if (poll_ec) {
+        fail_pending(poll_ec);
+        close();
+        return;
+      }
+      if (poll_spin_)
+        continue;
+      // Timer cadence (URMA_RPC_POLL_SPIN=0): after an active burst, or when
+      // idle, hand the thread back to the reactor for poll_interval.
+      if (completion_count == 0 || active_poll_budget_ == 0) {
+        active_poll_budget_ = max_active_poll_budget_;
+        start_polling();
+        return;
+      }
+      --active_poll_budget_;
     }
-    if (completion_count == 0) {
-      active_poll_budget_ = max_active_poll_budget_;
-      start_polling();
-      return;
-    }
-    if (active_poll_budget_ == 0) {
-      active_poll_budget_ = max_active_poll_budget_;
-      start_polling();
-      return;
-    }
-    --active_poll_budget_;
     auto self = shared_from_this();
     asio::post(executor_->get_asio_executor(), [self] {
       if (self->has_close_)
@@ -694,7 +707,8 @@ struct urma_socket_shared_state_t
               << (use_event ? "event" : "timer-poll")
               << ", pending_poll_budget=" << pending_poll_budget_
               << ", idle_busy_poll_budget=" << busy_poll_budget_
-              << ", idle_poll_interval_us=" << idle_poll_interval_.count();
+              << ", idle_poll_interval_us=" << idle_poll_interval_.count()
+              << ", timer_poll=" << (poll_spin_ ? "spin" : "timer");
     if (use_event) {
       // Tune moderation only once the jfce is actually consumed by this loop.
       apply_jfc_moderation();
@@ -802,7 +816,10 @@ struct urma_socket_shared_state_t
   int jfc_moderate_count_ = 1;
   int jfc_moderate_period_ = -1;
   std::chrono::microseconds idle_poll_interval_{5};
+  bool poll_spin_ = true;
   static constexpr std::size_t max_active_poll_budget_ = 64;
+  // Poll rounds executed inline before yielding to the io_context in spin mode.
+  static constexpr std::size_t kPollInlineBatch = 8;
   // Upper bound on consecutive non-empty drain rounds per jfce event.
   static constexpr std::size_t kMaxDrainRounds = 64;
   std::size_t active_poll_budget_ = max_active_poll_budget_;
@@ -844,6 +861,14 @@ class urma_socket_t {
     int jfc_moderate_count = 1;
     int jfc_moderate_period = -1;
     std::chrono::microseconds poll_interval{5};
+    // Timer-mode only (event_mode=false). true polls the CQ continuously from
+    // the reactor thread instead of arming an asio steady_timer every
+    // poll_interval: one poll round is a userspace udma_u_poll_jfc, while a
+    // timer tick costs two timerfd_settime plus an epoll wake-up. This removes
+    // the per-socket timerfd storm and cuts completion latency to one poll
+    // round, at the cost of one busy core per reactor thread that owns a
+    // timer-mode socket. Set URMA_RPC_POLL_SPIN=0 to restore the timer cadence.
+    bool poll_spin = true;
   };
 
   enum io_type { recv = 0, send = 1 };
@@ -1152,6 +1177,7 @@ class urma_socket_t {
     state_->jfc_moderate_count_ = conf_.jfc_moderate_count;
     state_->jfc_moderate_period_ = conf_.jfc_moderate_period;
     state_->idle_poll_interval_ = conf_.poll_interval;
+    state_->poll_spin_ = conf_.poll_spin;
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode,
                       conf_.jfs_priority, conf_.tp_type)) {
       auto stage = state_->init_stage_;

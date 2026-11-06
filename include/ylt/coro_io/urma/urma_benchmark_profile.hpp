@@ -26,7 +26,9 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace coro_io::urma_benchmark_profile {
@@ -128,6 +130,10 @@ inline std::atomic<uint32_t>& sample_rate_value() {
 
 inline void print(std::ostream& os);
 
+// Periodic printer thread: added so a long-running process reports without
+// waiting for exit (SIGKILL/SIGINT never runs atexit handlers).
+inline void start_periodic_printer();
+
 inline void init_from_env() {
   static std::once_flag flag;
   std::call_once(flag, [] {
@@ -146,9 +152,10 @@ inline void init_from_env() {
     }
     if (enabled_flag().load(std::memory_order_relaxed)) {
       std::atexit([]() {
-        std::fprintf(stderr, "[rpc_profile] atexit: printing profile\n");
+        std::fprintf(stderr, "[rpc_profile] atexit: printing final profile\n");
         print(std::cerr);
       });
+      start_periodic_printer();
     }
   });
 }
@@ -179,32 +186,39 @@ struct thread_samples {
              static_cast<std::size_t>(stage::count)>
       samples;
   std::array<uint32_t, static_cast<std::size_t>(stage::count)> counters{};
+  // counters[] already published into the merged pool by flush_local_samples().
+  std::array<uint32_t, static_cast<std::size_t>(stage::count)> flushed{};
   ~thread_samples();
 };
 
+// These are process-lifetime objects, deliberately leaked: function-local
+// statics would be destroyed at exit before the join-atexit below runs, racing
+// the periodic printer thread that still reads them (TSAN flags it). A
+// diagnostic profiler may leak a few node-sized allocations at exit.
 inline std::mutex& registry_mutex() {
-  static std::mutex value;
-  return value;
+  static auto* value = new std::mutex();
+  return *value;
 }
 
 inline std::array<std::array<std::vector<uint64_t>, bucket_count>,
                   static_cast<std::size_t>(stage::count)>&
 merged_samples() {
-  static std::array<std::array<std::vector<uint64_t>, bucket_count>,
-                    static_cast<std::size_t>(stage::count)>
-      value;
-  return value;
+  static auto* value =
+      new std::array<std::array<std::vector<uint64_t>, bucket_count>,
+                     static_cast<std::size_t>(stage::count)>();
+  return *value;
 }
 
 inline std::array<uint32_t, static_cast<std::size_t>(stage::count)>&
 merged_counters() {
-  static std::array<uint32_t, static_cast<std::size_t>(stage::count)> value{};
-  return value;
+  static auto* value =
+      new std::array<uint32_t, static_cast<std::size_t>(stage::count)>();
+  return *value;
 }
 
 inline std::vector<thread_samples*>& registry() {
-  static std::vector<thread_samples*> value;
-  return value;
+  static auto* value = new std::vector<thread_samples*>();
+  return *value;
 }
 
 inline thread_samples& local_samples() {
@@ -218,12 +232,57 @@ inline thread_samples& local_samples() {
   return value;
 }
 
+// Records between two publications of this thread's samples into the merged
+// pool. Keeps the periodic-printer lock off the hot path (one lock per 1024
+// records) while keeping printed data at most kFlushInterval samples stale.
+inline constexpr uint32_t kFlushInterval = 1024;
+
+// Serializes profile output between the periodic printer and the atexit dump.
+// Leaked on purpose, like the merged pool above.
+inline std::mutex& print_mutex() {
+  static auto* value = new std::mutex();
+  return *value;
+}
+
+// Move this thread's pending samples/counters into the merged pool. Must run on
+// the owning thread (it touches thread_local storage); the printer thread only
+// ever reads the merged pool, under registry_mutex().
+inline void flush_local_samples() {
+  auto& local = local_samples();
+  std::lock_guard<std::mutex> lock(registry_mutex());
+  auto& dst = merged_samples();
+  auto& dst_cnt = merged_counters();
+  for (std::size_t s = 0; s < local.samples.size(); ++s) {
+    dst_cnt[s] += local.counters[s] - local.flushed[s];
+    local.flushed[s] = local.counters[s];
+    for (std::size_t b = 0; b < bucket_count; ++b) {
+      auto& src = local.samples[s][b];
+      if (src.empty())
+        continue;
+      dst[s][b].insert(dst[s][b].end(), src.begin(), src.end());
+      src.clear();
+    }
+  }
+}
+
+// Drop already-published data. Used by YLT_RPC_PROFILE_RESET=1 so every print
+// covers one interval window instead of the whole process lifetime.
+inline void reset_merged() {
+  std::lock_guard<std::mutex> lock(registry_mutex());
+  auto& dst = merged_samples();
+  for (auto& stage_buckets : dst)
+    for (auto& bucket : stage_buckets) bucket.clear();
+  merged_counters().fill(0);
+}
+
 inline thread_samples::~thread_samples() {
   std::lock_guard<std::mutex> lock(registry_mutex());
   auto& dst = merged_samples();
   auto& dst_cnt = merged_counters();
   for (std::size_t s = 0; s < samples.size(); ++s) {
-    dst_cnt[s] += counters[s];
+    // Only publish what flush_local_samples() has not already published.
+    dst_cnt[s] += counters[s] - flushed[s];
+    flushed[s] = counters[s];
     for (std::size_t b = 0; b < bucket_count; ++b) {
       dst[s][b].insert(dst[s][b].end(), samples[s][b].begin(),
                        samples[s][b].end());
@@ -243,6 +302,12 @@ inline void record_with_size(stage stage_id, uint64_t duration_ns,
   auto b = size_to_bucket(payload_size);
   auto rate = sample_rate_value().load(std::memory_order_relaxed);
   auto counter = ++local.counters[s];
+  // Publish this thread's pending samples into the merged pool regularly, so a
+  // periodic printer thread can read stable data. Doing it here (on the owning
+  // thread) keeps the printer lock-protected and off the hot path: one lock per
+  // kFlushInterval records.
+  if ((counter % kFlushInterval) == 0)
+    flush_local_samples();
   if ((counter % rate) != 0)
     return;
   local.samples[s][b].push_back(duration_ns);
@@ -278,6 +343,10 @@ inline void reserve_per_stage(std::size_t count) {
 }
 
 inline void print(std::ostream& os) {
+  // Only the merged pool is read here: recording threads publish into it under
+  // registry_mutex() every kFlushInterval samples, so the periodic printer
+  // never touches another thread's live vectors.
+  std::lock_guard<std::mutex> print_lock(print_mutex());
   // merged[stage][bucket] -> samples
   std::array<std::array<std::vector<uint64_t>, bucket_count>,
              static_cast<std::size_t>(stage::count)>
@@ -290,17 +359,6 @@ inline void print(std::ostream& os) {
       for (std::size_t b = 0; b < bucket_count; ++b) {
         auto& src = merged_samples()[s][b];
         merged[s][b].insert(merged[s][b].end(), src.begin(), src.end());
-      }
-    }
-    for (auto* thread : registry()) {
-      if (thread == nullptr)
-        continue;
-      for (std::size_t s = 0; s < merged.size(); ++s) {
-        total_counters[s] += thread->counters[s];
-        for (std::size_t b = 0; b < bucket_count; ++b) {
-          auto& src = thread->samples[s][b];
-          merged[s][b].insert(merged[s][b].end(), src.begin(), src.end());
-        }
       }
     }
   }
@@ -547,6 +605,128 @@ inline void print(std::ostream& os) {
     os << "\n[urma]\n";
     parent(0, true, "read_view", st(stage::urma_read_view));
   }
+
+  // ── Orphan URMA stages ──
+  // urma.write_* / urma.read_* are normally rendered as children of the
+  // RPC-level stages (client_send_request / client_recv_header /
+  // server_read_payload). Consumers that only instrument the URMA layer (for
+  // example Mooncake's store RPC path) would otherwise get an empty report, so
+  // dump those stages flat when their parent was never recorded.
+  const bool have_write_parent =
+      has(static_cast<std::size_t>(stage::client_send_request)) ||
+      has(static_cast<std::size_t>(stage::server_send_response));
+  const bool have_read_parent =
+      has(static_cast<std::size_t>(stage::client_recv_header)) ||
+      has(static_cast<std::size_t>(stage::server_read_payload)) ||
+      has(static_cast<std::size_t>(stage::client_recv_payload));
+  const bool orphan_write =
+      !have_write_parent &&
+      (has(static_cast<std::size_t>(stage::urma_write_total)) ||
+       has(static_cast<std::size_t>(stage::urma_write_copy)) ||
+       has(static_cast<std::size_t>(stage::urma_post_send)) ||
+       has(static_cast<std::size_t>(stage::urma_wait_send_completion)));
+  const bool orphan_read =
+      !have_read_parent &&
+      (has(static_cast<std::size_t>(stage::urma_read_wait_completion)) ||
+       has(static_cast<std::size_t>(stage::urma_read_copy)));
+  if (orphan_write || orphan_read) {
+    os << "\n[urma-stage] (no RPC-level parent recorded)\n";
+    if (orphan_write) {
+      if (has(static_cast<std::size_t>(stage::urma_write_total)))
+        node(0, false, "urma.write_total", st(stage::urma_write_total));
+      if (has(static_cast<std::size_t>(stage::urma_write_copy)))
+        node(0, false, "urma.write_copy", st(stage::urma_write_copy));
+      if (has(static_cast<std::size_t>(stage::urma_post_send)))
+        node(0, false, "urma.post_send", st(stage::urma_post_send));
+      if (has(static_cast<std::size_t>(stage::urma_wait_send_completion)))
+        node(0, false, "urma.wait_send_completion",
+             st(stage::urma_wait_send_completion));
+    }
+    if (orphan_read) {
+      if (has(static_cast<std::size_t>(stage::urma_read_wait_completion)))
+        node(0, false, "urma.read_wait_completion",
+             st(stage::urma_read_wait_completion));
+      if (has(static_cast<std::size_t>(stage::urma_read_copy)))
+        node(0, true, "urma.read_copy", st(stage::urma_read_copy));
+    }
+  }
+}
+
+inline std::atomic<bool>& printer_stop_flag() {
+  static std::atomic<bool> value{true};
+  return value;
+}
+
+inline std::thread& printer_thread() {
+  static std::thread value;
+  return value;
+}
+
+// Periodically dump the profile to stderr while the process is still running.
+// Interval is YLT_RPC_PROFILE_INTERVAL_S seconds (default 10, <=0 disables).
+// YLT_RPC_PROFILE_RESET=1 prints each window and then clears the merged pool,
+// so every dump covers only the last interval instead of the whole process
+// life.
+inline void start_periodic_printer() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (!enabled_flag().load(std::memory_order_relaxed))
+      return;
+    const char* interval_env = std::getenv("YLT_RPC_PROFILE_INTERVAL_S");
+    long interval_s =
+        (interval_env && *interval_env) ? std::atol(interval_env) : 10;
+    if (interval_s <= 0) {
+      std::fprintf(stderr,
+                   "[rpc_profile] periodic printing disabled "
+                   "(YLT_RPC_PROFILE_INTERVAL_S=%ld)\n",
+                   interval_s);
+      return;
+    }
+    const char* reset_env = std::getenv("YLT_RPC_PROFILE_RESET");
+    bool reset_each_window =
+        reset_env != nullptr && (std::string_view(reset_env) == "1" ||
+                                 std::string_view(reset_env) == "on" ||
+                                 std::string_view(reset_env) == "true");
+    std::fprintf(stderr,
+                 "[rpc_profile] enabled: interval=%lds sample_rate=%u reset=%d "
+                 "(env YLT_RPC_PROFILE_INTERVAL_S / YLT_RPC_PROFILE_RESET)\n",
+                 interval_s,
+                 sample_rate_value().load(std::memory_order_relaxed),
+                 reset_each_window ? 1 : 0);
+
+    printer_stop_flag().store(false, std::memory_order_relaxed);
+    printer_thread() = std::thread([interval_s, reset_each_window] {
+      const auto start = std::chrono::steady_clock::now();
+      while (!printer_stop_flag().load(std::memory_order_relaxed)) {
+        // Wake in short slices so shutdown does not block for a whole window.
+        const int slices = static_cast<int>(interval_s * 10);
+        for (int i = 0; i < slices; ++i) {
+          if (printer_stop_flag().load(std::memory_order_relaxed))
+            return;
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (printer_stop_flag().load(std::memory_order_relaxed))
+          return;
+        const auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        std::ostringstream oss;
+        oss << "\n[rpc_profile] window_end=" << elapsed_s
+            << "s interval=" << interval_s << "s\n";
+        print(oss);
+        const std::string text = oss.str();
+        std::fwrite(text.data(), 1, text.size(), stderr);
+        std::fflush(stderr);
+        if (reset_each_window)
+          reset_merged();
+      }
+    });
+    std::atexit([] {
+      printer_stop_flag().store(true, std::memory_order_relaxed);
+      if (printer_thread().joinable())
+        printer_thread().join();
+    });
+  });
 }
 
 }  // namespace coro_io::urma_benchmark_profile

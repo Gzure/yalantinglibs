@@ -188,6 +188,9 @@ struct thread_samples {
   std::array<uint32_t, static_cast<std::size_t>(stage::count)> counters{};
   // counters[] already published into the merged pool by flush_local_samples().
   std::array<uint32_t, static_cast<std::size_t>(stage::count)> flushed{};
+  // Last publication time, so low-rate workloads still feed the periodic
+  // printer instead of waiting for kFlushInterval records.
+  uint64_t last_flush_ns = 0;
   ~thread_samples();
 };
 
@@ -232,10 +235,14 @@ inline thread_samples& local_samples() {
   return value;
 }
 
-// Records between two publications of this thread's samples into the merged
-// pool. Keeps the periodic-printer lock off the hot path (one lock per 1024
-// records) while keeping printed data at most kFlushInterval samples stale.
+// Records between two forced publications of this thread's samples into the
+// merged pool. Keeps the periodic-printer lock off the hot path (one lock per
+// kFlushInterval records). In addition, a lightweight time check every
+// kFlushTimeCheck records publishes at least every kFlushMaxAgeNs, so a
+// low-rate workload still has data in each printer window.
 inline constexpr uint32_t kFlushInterval = 1024;
+inline constexpr uint32_t kFlushTimeCheck = 64;
+inline constexpr uint64_t kFlushMaxAgeNs = 100ull * 1000 * 1000;
 
 // Serializes profile output between the periodic printer and the atexit dump.
 // Leaked on purpose, like the merged pool above.
@@ -249,6 +256,7 @@ inline std::mutex& print_mutex() {
 // ever reads the merged pool, under registry_mutex().
 inline void flush_local_samples() {
   auto& local = local_samples();
+  local.last_flush_ns = now_ns();
   std::lock_guard<std::mutex> lock(registry_mutex());
   auto& dst = merged_samples();
   auto& dst_cnt = merged_counters();
@@ -305,8 +313,11 @@ inline void record_with_size(stage stage_id, uint64_t duration_ns,
   // Publish this thread's pending samples into the merged pool regularly, so a
   // periodic printer thread can read stable data. Doing it here (on the owning
   // thread) keeps the printer lock-protected and off the hot path: one lock per
-  // kFlushInterval records.
-  if ((counter % kFlushInterval) == 0)
+  // kFlushInterval records, plus a cheap time check so low-rate workloads are
+  // still visible in every printer window.
+  if ((counter % kFlushInterval) == 0 ||
+      ((counter % kFlushTimeCheck) == 0 &&
+       now_ns() - local.last_flush_ns > kFlushMaxAgeNs))
     flush_local_samples();
   if ((counter % rate) != 0)
     return;

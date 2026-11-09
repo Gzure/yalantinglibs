@@ -35,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include "asio/any_io_executor.hpp"
 #include "asio/post.hpp"
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/easylog.hpp"
@@ -204,6 +205,16 @@ class jfc_group_registry {
     return static_cast<int>(sid);
   }
 
+  // Detaches a socket and releases its CQ reservation immediately.
+  //
+  // Caveat (needs device confirmation): CQEs the socket left in the shared JFC,
+  // and any flush completions the driver posts while deleting its jetty/jfr,
+  // still occupy physical CQ slots for a short while. If UMDK does not drain
+  // them before a new socket reserves the freed budget, the group can over-sell
+  // the CQ and new posts may fail with a full-CQ error. Those failures are
+  // handled (the send is failed back to the caller, unknown-sid completions are
+  // dropped), so the degradation is a transient error rather than corruption,
+  // but a device-side drain (or delaying the release) may be required.
   bool detach(int sid) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (sid < 0)
@@ -340,33 +351,57 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
 
   // executor and urma_context together identify a group: one io_context may in
   // principle carry sockets from different devices.
+  //
+  // The group keeps an asio::any_io_executor (not a raw ExecutorWrapper*), so
+  // the io_context cannot be destroyed while the group still posts to it; that
+  // also makes the execution_context address used as the lookup key stable for
+  // as long as the group lives, so a recycled address cannot route a socket to
+  // a stale group.
   static std::shared_ptr<urma_jfc_group> get(
       coro_io::ExecutorWrapper<>* executor, urma_context_t* context,
       uint32_t cq_size, uint32_t max_cq_depth, uint32_t io_rate) {
     if (!executor || !context)
       return nullptr;
-    const auto key = std::make_pair(
-        static_cast<void*>(&executor->get_asio_executor().context()),
-        static_cast<void*>(context));
-    std::lock_guard<std::mutex> lock(registry_mutex());
-    auto& groups = registry();
-    prune_expired_locked(groups);
-    auto it = groups.find(key);
-    if (it != groups.end()) {
-      if (auto existing = it->second.lock()) {
-        if (!existing->failed_.load(std::memory_order_relaxed))
-          return existing;
-        // A failed group must not be handed to new sockets: they would never
-        // see completions. Drop the reference and build a fresh one.
-        it->second.reset();
+    auto asio_executor = executor->get_asio_executor();
+    const auto key =
+        std::make_pair(static_cast<void*>(&asio_executor.context()),
+                       static_cast<void*>(context));
+    {
+      // Fast path: an existing live group, without creating anything.
+      std::lock_guard<std::mutex> lock(registry_mutex());
+      auto& groups = registry();
+      prune_expired_locked(groups);
+      auto it = groups.find(key);
+      if (it != groups.end()) {
+        if (auto existing = it->second.lock()) {
+          if (!existing->failed_.load(std::memory_order_relaxed))
+            return existing;
+          it->second.reset();  // failed groups must not be reused
+        }
       }
     }
-    auto group =
-        std::shared_ptr<urma_jfc_group>(new urma_jfc_group(executor, io_rate));
+
+    // Create the JFC outside the process-wide lock: urma_create_jfc is a driver
+    // call and used to serialize group creation for every io_context.
+    auto group = std::shared_ptr<urma_jfc_group>(
+        new urma_jfc_group(std::move(asio_executor), io_rate));
     if (!group->init(context, cq_size, max_cq_depth))
       return nullptr;
-    groups[key] = group;
-    return group;
+
+    {
+      std::lock_guard<std::mutex> lock(registry_mutex());
+      auto& groups = registry();
+      prune_expired_locked(groups);
+      auto it = groups.find(key);
+      if (it != groups.end()) {
+        if (auto existing = it->second.lock()) {
+          if (!existing->failed_.load(std::memory_order_relaxed))
+            return existing;  // another thread won: drop our extra JFC
+        }
+      }
+      groups[key] = group;
+      return group;
+    }
   }
 
   ~urma_jfc_group() { stop(); }
@@ -433,8 +468,9 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
  private:
   using key_type = std::pair<void*, void*>;
 
-  urma_jfc_group(coro_io::ExecutorWrapper<>* executor, uint32_t io_rate)
-      : executor_(executor), io_rate_(std::max<uint32_t>(io_rate, 1)) {}
+  urma_jfc_group(asio::any_io_executor executor, uint32_t io_rate)
+      : executor_(std::move(executor)),
+        io_rate_(std::max<uint32_t>(io_rate, 1)) {}
 
   bool init(urma_context_t* context, uint32_t cq_size, uint32_t max_cq_depth) {
     if (max_cq_depth != 0 && cq_size > max_cq_depth) {
@@ -464,7 +500,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
 
   void schedule() {
     auto self = shared_from_this();
-    asio::post(executor_->get_asio_executor(), [self] {
+    asio::post(executor_, [self] {
       self->poll_once();
     });
   }
@@ -474,7 +510,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     if (!alive_.load(std::memory_order_relaxed))
       return;
     auto self = shared_from_this();
-    asio::post(executor_->get_asio_executor(), [self] {
+    asio::post(executor_, [self] {
       self->poll_once();
     });
   }
@@ -501,8 +537,20 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
         return;
       }
       for (int i = 0; i < count; ++i) {
-        if (!registry_.dispatch(completions[i]))
-          ++stale_completions_;
+        // A socket callback resumes application coroutines. A throwing callback
+        // must not kill the group's poll loop (which would silently stop every
+        // socket on this io_context), so catch per completion and keep
+        // draining.
+        try {
+          if (!registry_.dispatch(completions[i]))
+            ++stale_completions_;
+        } catch (const std::exception& e) {
+          ++dispatch_failures_;
+          ELOG_ERROR << "URMA shared JFC dispatch threw: " << e.what();
+        } catch (...) {
+          ++dispatch_failures_;
+          ELOG_ERROR << "URMA shared JFC dispatch threw an unknown exception";
+        }
       }
     }
     // No attached socket: let the group be destroyed instead of keeping itself
@@ -513,9 +561,10 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     {
       std::lock_guard<std::mutex> lock(registry_mutex());
       if (registry_.size() == 0) {
-        if (stale_completions_ != 0) {
+        if (stale_completions_ != 0 || dispatch_failures_ != 0) {
           ELOG_INFO << "URMA shared JFC: dropped " << stale_completions_
-                    << " completion(s) for detached sockets";
+                    << " completion(s) for detached sockets, "
+                    << dispatch_failures_ << " dispatch exception(s)";
         }
         alive_.store(false, std::memory_order_relaxed);
         polling_.store(false, std::memory_order_relaxed);
@@ -563,7 +612,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return *value;
   }
 
-  coro_io::ExecutorWrapper<>* executor_ = nullptr;
+  asio::any_io_executor executor_;
   std::unique_ptr<urma_jfc_t, jfc_deleter> jfc_;
   jfc_group_registry registry_;
   uint32_t io_rate_ = 8;
@@ -572,6 +621,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   std::atomic<bool> alive_{true};
   std::atomic<bool> failed_{false};
   std::size_t stale_completions_ = 0;
+  std::size_t dispatch_failures_ = 0;
 };
 
 }  // namespace coro_io::detail

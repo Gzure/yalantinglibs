@@ -577,6 +577,12 @@ TEST_CASE("urma io_rate percentage maps to poll rounds per yield") {
     CHECK(poll_rounds_from_io_rate(percent) <= kMaxPollRounds);
 }
 
+TEST_CASE("urma shared jfc group needs an executor and a device context") {
+  using coro_io::detail::urma_jfc_group;
+  // Degenerate inputs must fail instead of dereferencing a null executor.
+  CHECK(urma_jfc_group::get(nullptr, nullptr, 1024, 0, 50) == nullptr);
+}
+
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {
   scoped_env_var enable("URMA_RPC_ENABLE", "0");
 

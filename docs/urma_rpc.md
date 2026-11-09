@@ -124,6 +124,13 @@ export URMA_RPC_EID_INDEX=0
 
 **共享 JFC 的容量估算**：默认 `RECV_BUFFER_CNT=8 / SEND_BUFFER_CNT=4` 时每 socket 约 16 个在途 WR，`GROUP_CQ_SIZE=2048` 可容纳约 128 个 socket；若按吞吐配置 `128/128`，每 socket 约 260 个 WR，4 个 socket 就需要 ≥1040，建议直接把 `GROUP_CQ_SIZE` 设到 4096 或降低 buffer 数。共享 JFC 属于**未在硬件上充分验证**的能力，建议先用 `URMA_RPC_SHARED_JFC=0` 建立基线，再以 `1` 做 A/B，并观察 `URMA shared JFC`、`attach failed`、`poll failed` 日志。
 
+**共享 JFC 已知待上机确认项**：
+
+1. 驱动是否把 `urma_jfs_wr_t::user_ctx` / `urma_jfr_wr_t::user_ctx` 原样回填到 `urma_cr_t::user_ctx`。不回填时组会丢弃所有完成（socket 层看到 `user_ctx==0` 被当无效记录），表现为连接静默挂起；
+2. 多 jetty 共享同一 JFC 是否被 UMDK 支持；`urma_delete_jetty` 时 flush CQE 是否进入共享 JFC。当前 `detach` 立即归还 CQ 额度，若驱动仍可能投递残留/flush CQE，短时间内可能超卖——后果是新的 post 失败并返回给调用方（不会静默错配），必要时改成延迟归还；
+3. 同一 JFR 的 recv 完成是否严格保序（当前按 FIFO 从 `recv_queue_` 取 buffer）；若多 TP/多 sender 下可能乱序，需要改成按 `user_ctx` 里的 recv seq 匹配；
+4. 共享模式要求 `init()`/`attach()` 与轮询在同一个 io_context 线程（组内单线程假设）；跨线程 attach 虽已加锁，但 `poll_once` 的调度仍应只在所属 io_context 线程执行。
+
 **timer 兜底路径的取舍**：`URMA_RPC_POLL_SPIN=1`（默认）把完成检测延迟压到一次轮询（亚微秒），代价是每个含 timer 模式 socket 的 reactor 线程一个忙核——服务端用 `--rpc_thread_num` 限核，或设 `URMA_RPC_POLL_SPIN=0` 换回定时器。若目标是 13~20µs RTT，建议优先用事件模式（`URMA_RPC_EVENT_MODE=1`）；timer 路径是事件模式不可用时的兜底。
 
 事件模式的延迟取决于 **JFCE 唤醒延迟**，而不是轮询预算。若事件模式时延仍偏高，按下面顺序排查：

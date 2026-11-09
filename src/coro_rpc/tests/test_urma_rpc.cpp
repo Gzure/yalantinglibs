@@ -510,6 +510,37 @@ TEST_CASE("urma seq slot ring rejects a completion whose seq tag differs") {
   CHECK(*v1 == 11);
 }
 
+TEST_CASE("urma seq slot ring keeps its value when push fails") {
+  coro_io::detail::seq_slot_ring<int> ring(8);
+  CHECK(ring.push(3, 33));
+  // 11 % 8 == 3 is still occupied: a failed push must not overwrite (or
+  // consume) the pending value, or the caller would leak its buffer and lose
+  // its callback.
+  CHECK_FALSE(ring.push(11, 44));
+  CHECK(ring.in_flight() == 1);
+  auto v3 = ring.take(3);
+  REQUIRE(v3.has_value());
+  CHECK(*v3 == 33);
+}
+
+TEST_CASE("urma seq slot ring drains entries across sequence holes") {
+  coro_io::detail::seq_slot_ring<int> ring(8);
+  CHECK(ring.push(1, 11));
+  auto first = ring.take(1);
+  REQUIRE(first.has_value());
+  CHECK(*first == 11);
+  // seq 9 lands in slot 1 with tag 9, i.e. not congruent to the slot index: a
+  // drain that iterated take(0..capacity) would miss it and strand the send.
+  CHECK(ring.push(9, 99));
+  int drained = 0;
+  ring.drain_each([&drained](int&& value) {
+    CHECK(value == 99);
+    ++drained;
+  });
+  CHECK(drained == 1);
+  CHECK(ring.in_flight() == 0);
+}
+
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {
   scoped_env_var enable("URMA_RPC_ENABLE", "0");
 

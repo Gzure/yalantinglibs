@@ -417,7 +417,11 @@ struct urma_socket_shared_state_t
                std::move(callback));
         return;
       }
-      seq = ++send_seq_;
+      // seq 0 with sid 0 would encode to user_ctx == 0, which the group treats
+      // as "driver did not fill user_ctx"; skip it on wraparound.
+      if (++send_seq_ == 0)
+        ++send_seq_;
+      seq = send_seq_;
       reserved.emplace(
           pending_send{std::move(buffer), length, std::move(callback)});
       if (!send_slots_->push(seq, std::move(*reserved))) {

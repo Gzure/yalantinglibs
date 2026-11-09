@@ -226,6 +226,11 @@ class jfc_group_registry {
     const auto ctx = decode_ctx(cr.user_ctx);
     if (!is_valid_ctx_op(ctx.op))
       return false;
+    // The user_ctx and the completion direction must agree; if they do not, the
+    // driver did not round-trip user_ctx correctly and dispatching would settle
+    // the wrong pending work.
+    if ((cr.flag.bs.s_r != 0) != (ctx.op == urma_ctx_op::recv))
+      return false;
     std::shared_ptr<jfc_group_socket> socket;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -374,21 +379,22 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   // wr_reserve: work requests this socket may keep in flight (send + recv
   // buffers + slack). Returns sid, or < 0 on failure (group full / CQ too
   // small / group already failed).
+  //
+  // Everything happens under registry_mutex() so a concurrent fail_all() either
+  // runs before this attach (which then returns -3) or after it (and its
+  // for_each covers the new socket). There is no window that yields a socket
+  // with a sid but no poll loop.
   int attach(std::shared_ptr<jfc_group_socket> socket, uint32_t wr_reserve) {
+    std::lock_guard<std::mutex> lock(registry_mutex());
     if (failed_.load(std::memory_order_relaxed))
       return -3;
     const int sid = registry_.attach(std::move(socket), wr_reserve);
     if (sid < 0)
       return sid;
-    socket_count_.fetch_add(1, std::memory_order_relaxed);
-    // Restart the loop if the last detach stopped it. Holding the same mutex as
-    // the self-stop path closes the "attach vs self-stop" window.
-    std::lock_guard<std::mutex> lock(registry_mutex());
     if (failed_.load(std::memory_order_relaxed)) {
-      // The group failed while we were attaching: drop the reservation instead
-      // of handing out a socket that would never see completions.
+      // fail_all() won the race: drop the reservation instead of handing out a
+      // socket that would never see completions.
       registry_.detach(sid);
-      socket_count_.fetch_sub(1, std::memory_order_relaxed);
       return -3;
     }
     alive_.store(true, std::memory_order_relaxed);
@@ -397,10 +403,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return sid;
   }
 
-  void detach(int sid) {
-    if (registry_.detach(sid))
-      socket_count_.fetch_sub(1, std::memory_order_relaxed);
-  }
+  void detach(int sid) { registry_.detach(sid); }
 
   // Starts the single poll tick for this io_context (idempotent).
   void ensure_polling() {
@@ -425,9 +428,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   bool failed() const noexcept {
     return failed_.load(std::memory_order_relaxed);
   }
-  std::size_t socket_count() const {
-    return socket_count_.load(std::memory_order_relaxed);
-  }
+  std::size_t socket_count() const { return registry_.size(); }
 
  private:
   using key_type = std::pair<void*, void*>;
@@ -479,14 +480,20 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   }
 
   void poll_once() {
+    // Any early exit must clear polling_, otherwise a later attach() would skip
+    // the restart and the group would keep a sid with no poll loop.
     if (!alive_.load(std::memory_order_relaxed) ||
-        failed_.load(std::memory_order_relaxed))
+        failed_.load(std::memory_order_relaxed)) {
+      polling_.store(false, std::memory_order_relaxed);
       return;
+    }
     std::array<urma_cr_t, 16> completions{};
     for (std::size_t round = 0; round < io_rate_; ++round) {
       if (!alive_.load(std::memory_order_relaxed) ||
-          failed_.load(std::memory_order_relaxed))
+          failed_.load(std::memory_order_relaxed)) {
+        polling_.store(false, std::memory_order_relaxed);
         return;
+      }
       int count = urma_poll_jfc(
           jfc_.get(), static_cast<int>(completions.size()), completions.data());
       if (count < 0) {
@@ -499,10 +506,13 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
       }
     }
     // No attached socket: let the group be destroyed instead of keeping itself
-    // alive through the posted tick. attach() restarts the loop.
-    if (socket_count_.load(std::memory_order_relaxed) == 0) {
+    // alive through the posted tick. attach() restarts the loop. The registry
+    // is the single source of truth here (it already accounts for sockets that
+    // died without detaching); a separate counter used to diverge from it and
+    // keep the loop spinning forever.
+    {
       std::lock_guard<std::mutex> lock(registry_mutex());
-      if (socket_count_.load(std::memory_order_relaxed) == 0) {
+      if (registry_.size() == 0) {
         if (stale_completions_ != 0) {
           ELOG_INFO << "URMA shared JFC: dropped " << stale_completions_
                     << " completion(s) for detached sockets";
@@ -516,11 +526,17 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   }
 
   void fail_all(std::error_code ec) {
+    // Publish the failure while holding the same mutex attach() uses, and set
+    // failed_ first: a concurrent attach then either sees it (and returns -3)
+    // or is ordered before this and gets covered by for_each below.
+    {
+      std::lock_guard<std::mutex> lock(registry_mutex());
+      failed_.store(true, std::memory_order_relaxed);
+      alive_.store(false, std::memory_order_relaxed);
+      polling_.store(false, std::memory_order_relaxed);
+    }
     ELOG_ERROR << "URMA shared JFC poll failed: " << ec.message()
                << "; failing " << registry_.size() << " socket(s)";
-    alive_.store(false, std::memory_order_relaxed);
-    polling_.store(false, std::memory_order_relaxed);
-    failed_.store(true, std::memory_order_relaxed);
     registry_.for_each([ec](jfc_group_socket& socket) {
       socket.on_group_error(ec);
     });
@@ -555,7 +571,6 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   std::atomic<bool> polling_{false};
   std::atomic<bool> alive_{true};
   std::atomic<bool> failed_{false};
-  std::atomic<std::size_t> socket_count_{0};
   std::size_t stale_completions_ = 0;
 };
 

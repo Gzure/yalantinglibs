@@ -185,6 +185,20 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
               << "; clamped to the 1.." << max_io_rate << " range";
     config.io_rate = config.io_rate < 1 ? 1 : max_io_rate;
   }
+  config.shared_jfc = urma_rpc_env_flag("URMA_RPC_SHARED_JFC",
+                                        /*default*/ false);
+  urma_rpc_parse_env_integer("URMA_RPC_GROUP_CQ_SIZE", config.group_cq_size);
+  constexpr uint32_t min_group_cq_size = 64;
+  constexpr uint32_t max_group_cq_size = 65536;
+  if (config.group_cq_size < min_group_cq_size ||
+      config.group_cq_size > max_group_cq_size) {
+    ELOG_WARN << "invalid URMA_RPC_GROUP_CQ_SIZE value: "
+              << config.group_cq_size << "; clamped to the "
+              << min_group_cq_size << ".." << max_group_cq_size << " range";
+    config.group_cq_size = config.group_cq_size < min_group_cq_size
+                               ? min_group_cq_size
+                               : max_group_cq_size;
+  }
 
   return config;
 }
@@ -220,7 +234,9 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
               << ", jfc_moderate_count=" << config.jfc_moderate_count
               << ", jfc_moderate_period=" << config.jfc_moderate_period
               << ", timer_poll=" << (config.poll_spin ? "spin" : "timer")
-              << ", io_rate=" << config.io_rate;
+              << ", io_rate=" << config.io_rate
+              << ", shared_jfc=" << (config.shared_jfc ? "on" : "off")
+              << ", group_cq_size=" << config.group_cq_size;
     return config;
   } catch (const std::exception& e) {
     ELOG_WARN << "URMA RPC auto enable failed: " << e.what()

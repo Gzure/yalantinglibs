@@ -60,6 +60,7 @@ class scoped_env_var {
 };
 
 #ifdef YLT_ENABLE_URMA
+#include <ylt/coro_io/urma/urma_jfc_group.hpp>
 #include <ylt/coro_io/urma/urma_rpc_env.hpp>
 
 TEST_CASE("urma rpc env enable parsing") {
@@ -303,6 +304,146 @@ TEST_CASE("urma rpc env pending poll budget and jfc moderation") {
     // Negative values do not parse into std::size_t: keep the default.
     CHECK(config.pending_poll_budget == 1);
   }
+}
+
+TEST_CASE("urma rpc shared jfc env defaults and clamping") {
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // Sharing a JFC between sockets is opt-in: it needs driver support for
+    // several jetties on one completion queue.
+    CHECK(config.shared_jfc == false);
+    CHECK(config.group_cq_size == 2048);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var shared("URMA_RPC_SHARED_JFC", "on");
+    scoped_env_var cq("URMA_RPC_GROUP_CQ_SIZE", "4096");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.shared_jfc == true);
+    CHECK(config.group_cq_size == 4096);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var cq("URMA_RPC_GROUP_CQ_SIZE", "1");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.group_cq_size == 64);  // clamped to the minimum useful depth
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var cq("URMA_RPC_GROUP_CQ_SIZE", "1000000");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.group_cq_size == 65536);
+  }
+}
+
+TEST_CASE("urma shared jfc user_ctx codec round trips") {
+  using coro_io::detail::decode_ctx;
+  using coro_io::detail::encode_ctx;
+  using coro_io::detail::urma_ctx_op;
+  for (auto op : {urma_ctx_op::send, urma_ctx_op::recv}) {
+    for (uint32_t sid : {0u, 1u, 12345u, (1u << 28) - 1}) {
+      for (uint32_t seq : {0u, 1u, 0x12345678u, 0xFFFFFFFFu}) {
+        const auto decoded = decode_ctx(encode_ctx(op, sid, seq));
+        CHECK(decoded.op == op);
+        CHECK(decoded.sid == sid);
+        CHECK(decoded.seq == seq);
+      }
+    }
+  }
+  // Same sid+seq must still differ between send and recv, so a mis-tagged work
+  // request is detectable instead of being dispatched to the wrong handler.
+  CHECK(encode_ctx(urma_ctx_op::send, 7, 9) !=
+        encode_ctx(urma_ctx_op::recv, 7, 9));
+}
+
+TEST_CASE("urma seq slot ring matches out-of-order completions") {
+  coro_io::detail::seq_slot_ring<int> ring(8);
+  CHECK(ring.push(1, 11));
+  CHECK(ring.push(2, 22));
+  CHECK(ring.in_flight() == 2);
+  CHECK(ring.contains(2));
+  auto v2 = ring.take(2);  // a shared CQ delivers completions out of order
+  REQUIRE(v2.has_value());
+  CHECK(*v2 == 22);
+  CHECK(!ring.contains(2));
+  auto v1 = ring.take(1);  // free slot 1 so seq 9 can wrap onto it
+  REQUIRE(v1.has_value());
+  CHECK(*v1 == 11);
+  CHECK(ring.push(9, 99));  // 9 % 8 == 1
+  auto v9 = ring.take(9);
+  REQUIRE(v9.has_value());
+  CHECK(*v9 == 99);
+  CHECK(ring.in_flight() == 0);
+  CHECK_FALSE(ring.take(2).has_value());  // already taken
+  // A slot that is still occupied refuses a new seq mapping onto it instead of
+  // silently overwriting a pending send (which would leak its buffer).
+  CHECK(ring.push(3, 33));
+  CHECK_FALSE(ring.push(3 + 8, 44));
+  CHECK(ring.in_flight() == 1);
+}
+
+namespace {
+struct mock_group_socket : coro_io::detail::jfc_group_socket {
+  int sends = 0;
+  int recvs = 0;
+  int errors = 0;
+  void on_send_completion(const urma_cr_t&) override { ++sends; }
+  void on_recv_completion(const urma_cr_t&) override { ++recvs; }
+  void on_group_error(std::error_code) override { ++errors; }
+};
+
+urma_cr_t make_group_cr(coro_io::detail::urma_ctx_op op, uint32_t sid,
+                        uint32_t seq) {
+  urma_cr_t cr{};
+  cr.user_ctx = coro_io::detail::encode_ctx(op, sid, seq);
+  cr.flag.bs.s_r = (op == coro_io::detail::urma_ctx_op::recv) ? 1 : 0;
+  cr.status = URMA_CR_SUCCESS;
+  return cr;
+}
+}  // namespace
+
+TEST_CASE("urma jfc group registry dispatches by socket id") {
+  using coro_io::detail::jfc_group_registry;
+  using coro_io::detail::jfc_group_socket;
+  using coro_io::detail::urma_ctx_op;
+
+  jfc_group_registry registry(/*max_wr=*/512);
+  auto a = std::make_shared<mock_group_socket>();
+  auto b = std::make_shared<mock_group_socket>();
+  const int sid_a = registry.attach(a, 64);
+  const int sid_b = registry.attach(b, 64);
+  REQUIRE(sid_a >= 0);
+  REQUIRE(sid_b >= 0);
+  CHECK(sid_a != sid_b);
+  CHECK(registry.size() == 2);
+  CHECK(registry.used_wr() == 128);
+
+  CHECK(registry.dispatch(make_group_cr(urma_ctx_op::send, sid_a, 1)));
+  CHECK(registry.dispatch(make_group_cr(urma_ctx_op::recv, sid_b, 7)));
+  CHECK(a->sends == 1);
+  CHECK(a->recvs == 0);
+  CHECK(b->sends == 0);
+  CHECK(b->recvs == 1);
+
+  // Unknown socket id (or a completion that raced with close): dropped.
+  CHECK_FALSE(registry.dispatch(make_group_cr(urma_ctx_op::send, 9999u, 1)));
+
+  // Detached socket releases its CQ reservation and stops receiving dispatch.
+  CHECK(registry.detach(sid_b));
+  CHECK_FALSE(registry.dispatch(make_group_cr(urma_ctx_op::recv, sid_b, 8)));
+  CHECK(registry.used_wr() == 64);
+  CHECK(registry.size() == 1);
+
+  // The next socket cannot exceed the group CQ depth.
+  CHECK(registry.attach(std::make_shared<mock_group_socket>(), 512) == -2);
+
+  // Group-level failure is fanned out to every attached socket.
+  mock_group_socket* raw_a = a.get();
+  registry.for_each([&registry](jfc_group_socket& socket) {
+    socket.on_group_error(std::make_error_code(std::errc::io_error));
+  });
+  CHECK(raw_a->errors == 1);
 }
 
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {

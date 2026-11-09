@@ -81,6 +81,33 @@ inline std::error_code make_urma_error(int status) {
 // to retry the wait instead of treating it as an error).
 inline constexpr int kUrmaErestartsys = 512;
 
+// Spin-mode I/O share, expressed as a percentage of the reactor loop's time.
+//
+// One poll round is a userspace udma_u_poll_jfc (~0.2us); one yield costs an
+// io_context iteration (epoll_wait(0) + ready handlers, ~1.5us), roughly
+// kPollRoundsPerYieldCost poll rounds. To spend P% of the loop in polling with
+// S poll rounds per yield:
+//
+//   S*Tp / (S*Tp + Ty) = P/100   with Ty = k*Tp
+//   => S = k * P / (100 - P)
+//
+// So the percentage is a real time share up to that cost ratio; the raw round
+// count stays available when the estimate does not fit the machine.
+inline constexpr uint32_t kPollRoundsPerYieldCost = 8;
+inline constexpr uint32_t kMinPollRounds = 1;
+inline constexpr uint32_t kMaxPollRounds = 1024;
+
+inline uint32_t poll_rounds_from_io_rate(uint32_t percent) noexcept {
+  if (percent < 1)
+    percent = 1;
+  if (percent > 99)
+    percent = 99;  // 100% would never yield and starve accept/fd/timer handling
+  const uint64_t rounds = static_cast<uint64_t>(kPollRoundsPerYieldCost) *
+                          percent / (100 - percent);
+  return static_cast<uint32_t>(std::clamp<uint64_t>(
+      rounds == 0 ? 1 : rounds, kMinPollRounds, kMaxPollRounds));
+}
+
 struct urma_deleter {
   void operator()(urma_jfc_t* value) const {
     if (value)
@@ -868,7 +895,7 @@ struct urma_socket_shared_state_t
       ELOG_INFO << "URMA completion detection: mode=shared-jfc-poll"
                 << ", sid=" << group_sid_.load()
                 << ", jfc_depth=" << group_->cq_size()
-                << ", io_rate=" << io_rate_;
+                << ", io_rate_rounds=" << io_rate_;
       group_->ensure_polling();
       return;
     }
@@ -881,7 +908,7 @@ struct urma_socket_shared_state_t
               << ", idle_busy_poll_budget=" << busy_poll_budget_
               << ", idle_poll_interval_us=" << idle_poll_interval_.count()
               << ", timer_poll=" << (poll_spin_ ? "spin" : "timer")
-              << ", io_rate=" << io_rate_;
+              << ", io_rate_rounds=" << io_rate_;
     if (use_event) {
       // Tune moderation only once the jfce is actually consumed by this loop.
       apply_jfc_moderation();
@@ -1084,11 +1111,15 @@ class urma_socket_t {
     // round, at the cost of one busy core per reactor thread that owns a
     // timer-mode socket. Set URMA_RPC_POLL_SPIN=0 to restore the timer cadence.
     bool poll_spin = true;
-    // Spin mode only: poll rounds executed inline before yielding to the
-    // io_context, i.e. the I/O-polling share of the reactor loop (Netty
-    // ioRatio analogue). Larger = more time polling = lower completion latency,
-    // but handlers/fds/timers are serviced later. 1..1024, default 8.
-    uint32_t io_rate = 8;
+    // Spin mode only: share of the reactor loop's time spent polling the CQ,
+    // in percent (1..99). Converted to poll rounds per io_context yield with
+    // poll_rounds_from_io_rate(): 50% == 8 rounds (the previous default), 80%
+    // == 32, 90% == 72, 95% == 152. 100% is clamped to 99 because the loop must
+    // still yield to service accept/fd/timer handlers.
+    uint32_t io_rate = 50;
+    // Raw override for advanced tuning: poll rounds per yield (1..1024).
+    // 0 = derive from io_rate. Takes precedence over io_rate when non-zero.
+    uint32_t poll_rounds = 0;
     // Share one JFC between all URMA sockets of an io_context (poll mode only).
     // One poll loop then drains the group's CQEs and dispatches them inline on
     // the owning reactor thread. Off by default: it needs UMDK/driver support
@@ -1407,7 +1438,11 @@ class urma_socket_t {
     state_->jfc_moderate_period_ = conf_.jfc_moderate_period;
     state_->idle_poll_interval_ = conf_.poll_interval;
     state_->poll_spin_ = conf_.poll_spin;
-    state_->io_rate_ = conf_.io_rate;
+    state_->io_rate_ =
+        conf_.poll_rounds
+            ? std::clamp(conf_.poll_rounds, detail::kMinPollRounds,
+                         detail::kMaxPollRounds)
+            : detail::poll_rounds_from_io_rate(conf_.io_rate);
     state_->shared_jfc_ = conf_.shared_jfc;
     state_->group_cq_size_ = conf_.group_cq_size;
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode,

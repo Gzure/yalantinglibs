@@ -179,11 +179,23 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
   }
   config.poll_spin = urma_rpc_env_flag("URMA_RPC_POLL_SPIN", /*default*/ true);
   urma_rpc_parse_env_integer("URMA_RPC_IO_RATE", config.io_rate);
-  constexpr uint32_t max_io_rate = 1024;
+  constexpr uint32_t max_io_rate = 99;
   if (config.io_rate < 1 || config.io_rate > max_io_rate) {
     ELOG_WARN << "invalid URMA_RPC_IO_RATE value: " << config.io_rate
-              << "; clamped to the 1.." << max_io_rate << " range";
+              << " (percent); clamped to the 1.." << max_io_rate
+              << " range (100% would never yield the reactor loop)";
     config.io_rate = config.io_rate < 1 ? 1 : max_io_rate;
+  }
+  urma_rpc_parse_env_integer("URMA_RPC_POLL_ROUNDS", config.poll_rounds);
+  if (config.poll_rounds != 0 &&
+      (config.poll_rounds < coro_io::detail::kMinPollRounds ||
+       config.poll_rounds > coro_io::detail::kMaxPollRounds)) {
+    ELOG_WARN << "invalid URMA_RPC_POLL_ROUNDS value: " << config.poll_rounds
+              << "; clamped to the " << coro_io::detail::kMinPollRounds << ".."
+              << coro_io::detail::kMaxPollRounds << " range";
+    config.poll_rounds = config.poll_rounds < coro_io::detail::kMinPollRounds
+                             ? coro_io::detail::kMinPollRounds
+                             : coro_io::detail::kMaxPollRounds;
   }
   config.shared_jfc = urma_rpc_env_flag("URMA_RPC_SHARED_JFC",
                                         /*default*/ false);
@@ -234,7 +246,9 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
               << ", jfc_moderate_count=" << config.jfc_moderate_count
               << ", jfc_moderate_period=" << config.jfc_moderate_period
               << ", timer_poll=" << (config.poll_spin ? "spin" : "timer")
-              << ", io_rate=" << config.io_rate
+              << ", io_rate=" << config.io_rate << "%(rounds="
+              << coro_io::detail::poll_rounds_from_io_rate(config.io_rate)
+              << ", override=" << config.poll_rounds << ")"
               << ", shared_jfc=" << (config.shared_jfc ? "on" : "off")
               << ", group_cq_size=" << config.group_cq_size;
     return config;

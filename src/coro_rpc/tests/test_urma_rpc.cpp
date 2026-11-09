@@ -227,8 +227,9 @@ TEST_CASE("urma rpc env pending poll budget and jfc moderation") {
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
-    // Poll rounds per io_context yield: the I/O share of the reactor loop.
-    CHECK(config.io_rate == 8);
+    // I/O time share in percent; 50% == 8 poll rounds before a yield.
+    CHECK(config.io_rate == 50);
+    CHECK(config.poll_rounds == 0);
   }
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
@@ -240,13 +241,27 @@ TEST_CASE("urma rpc env pending poll budget and jfc moderation") {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
     scoped_env_var rate("URMA_RPC_IO_RATE", "4096");
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
-    CHECK(config.io_rate == 1024);  // clamped to the supported range
+    // 100% would never yield the reactor loop; clamp to the 1..99 range.
+    CHECK(config.io_rate == 99);
   }
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
     scoped_env_var rate("URMA_RPC_IO_RATE", "0");
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
     CHECK(config.io_rate == 1);  // 0 would mean "never poll"
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var rounds("URMA_RPC_POLL_ROUNDS", "64");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // Raw override wins over the percentage.
+    CHECK(config.poll_rounds == 64);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var rounds("URMA_RPC_POLL_ROUNDS", "9999");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.poll_rounds == coro_io::detail::kMaxPollRounds);  // clamped
   }
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
@@ -539,6 +554,27 @@ TEST_CASE("urma seq slot ring drains entries across sequence holes") {
   });
   CHECK(drained == 1);
   CHECK(ring.in_flight() == 0);
+}
+
+TEST_CASE("urma io_rate percentage maps to poll rounds per yield") {
+  using coro_io::detail::kMaxPollRounds;
+  using coro_io::detail::poll_rounds_from_io_rate;
+
+  // rounds = k * P / (100 - P) with k = 8 (one yielded io_context iteration
+  // costs about 8 poll rounds). 50% keeps the previous default of 8 rounds.
+  CHECK(poll_rounds_from_io_rate(50) == 8);
+  CHECK(poll_rounds_from_io_rate(80) == 32);
+  CHECK(poll_rounds_from_io_rate(90) == 72);
+  CHECK(poll_rounds_from_io_rate(95) == 152);
+  CHECK(poll_rounds_from_io_rate(99) == 792);
+  CHECK(poll_rounds_from_io_rate(1) == 1);
+  // Out-of-range percentages are clamped: 0/100 are not meaningful shares.
+  CHECK(poll_rounds_from_io_rate(0) == 1);
+  CHECK(poll_rounds_from_io_rate(100) == 792);
+  CHECK(poll_rounds_from_io_rate(2000) == 792);
+  CHECK(poll_rounds_from_io_rate(50) < poll_rounds_from_io_rate(90));
+  for (uint32_t percent = 1; percent <= 99; ++percent)
+    CHECK(poll_rounds_from_io_rate(percent) <= kMaxPollRounds);
 }
 
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {

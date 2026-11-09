@@ -227,32 +227,32 @@ struct urma_socket_shared_state_t
     if (shared_jfc_) {
       group_ = urma_jfc_group::get(executor_, device_->context(),
                                    group_cq_size_, cap.max_jfc_depth, io_rate_);
+      int sid = -1;
       if (group_ && group_->valid()) {
-        group_sid_ = group_->attach(
+        sid = group_->attach(
             shared_from_this(),
             static_cast<uint32_t>(recv_buffer_cnt_ + send_buffer_cnt + 4));
-        if (group_sid_ < 0) {
-          ELOG_WARN << "URMA shared JFC attach failed (sid=" << group_sid_
-                    << "): group full or CQ depth too small (depth="
-                    << group_->cq_size() << ", used_wr="
-                    << static_cast<unsigned>(recv_buffer_cnt_ +
-                                             send_buffer_cnt + 4)
-                    << "); using a per-socket JFC";
-          group_.reset();
-        }
+      }
+      if (sid < 0) {
+        ELOG_WARN << "URMA shared JFC unavailable (sid=" << sid
+                  << "): group failed/full or CQ depth too small (depth="
+                  << (group_ ? group_->cq_size() : 0) << ", requested="
+                  << static_cast<unsigned>(recv_buffer_cnt_ + send_buffer_cnt +
+                                           4)
+                  << "); using a per-socket JFC";
+        group_.reset();
+        shared_jfc_ = false;
       }
       else {
-        group_.reset();
+        group_sid_.store(sid);
       }
-      if (!group_)
-        shared_jfc_ = false;
     }
 
     if (group_) {
       event_mode_enabled_ = false;
       send_slots_ =
           std::make_unique<seq_slot_ring<pending_send>>(send_buffer_cnt + 2);
-      ELOG_INFO << "URMA using shared JFC: sid=" << group_sid_
+      ELOG_INFO << "URMA using shared JFC: sid=" << group_sid_.load()
                 << ", jfc_depth=" << group_->cq_size()
                 << ", sockets=" << group_->socket_count();
     }
@@ -357,8 +357,7 @@ struct urma_socket_shared_state_t
                    static_cast<urma_target_seg_t*>(buffer.seg), nullptr};
     urma_sg_t sg{&sge, 1};
     const uint64_t user_ctx =
-        group_ ? encode_ctx(urma_ctx_op::recv,
-                            static_cast<uint32_t>(group_sid_), ++recv_seq_)
+        group_ ? encode_ctx(urma_ctx_op::recv, group_sid_.load(), ++recv_seq_)
                : 0;
     urma_jfr_wr_t wr{sg, user_ctx, nullptr};
     urma_jfr_wr_t* bad_wr = nullptr;
@@ -405,10 +404,32 @@ struct urma_socket_shared_state_t
     wr.flag.bs.complete_enable = 1;
     wr.tjetty = remote_jetty_.get();
     uint32_t seq = 0;
+    std::optional<pending_send> reserved;
     if (group_) {
+      // Shared JFC: reserve the sequence slot BEFORE posting. Once the post
+      // succeeds the NIC owns the buffer, so a buffer must never be returned
+      // after this point; reserving first also makes the window check
+      // authoritative instead of racing with the post.
+      if (!send_slots_) {
+        if (buffer)
+          buffer_pool_->return_buffer(buffer);
+        resume({std::make_error_code(std::errc::no_buffer_space), 0},
+               std::move(callback));
+        return;
+      }
       seq = ++send_seq_;
-      wr.user_ctx =
-          encode_ctx(urma_ctx_op::send, static_cast<uint32_t>(group_sid_), seq);
+      reserved.emplace(
+          pending_send{std::move(buffer), length, std::move(callback)});
+      if (!send_slots_->push(seq, std::move(*reserved))) {
+        // Slot still occupied (in-flight window exhausted or a seq hole
+        // collision): push leaves the value untouched, so settle it here.
+        if (reserved->buffer)
+          buffer_pool_->return_buffer(reserved->buffer);
+        resume({std::make_error_code(std::errc::no_buffer_space), 0},
+               std::move(reserved->callback));
+        return;
+      }
+      wr.user_ctx = encode_ctx(urma_ctx_op::send, group_sid_.load(), seq);
     }
     else {
       wr.user_ctx = 1;
@@ -418,26 +439,23 @@ struct urma_socket_shared_state_t
     auto ec =
         make_urma_error(urma_post_jetty_send_wr(jetty_.get(), &wr, &bad_wr));
     if (ec) {
+      if (group_) {
+        // Release the reservation; the post never reached the hardware.
+        auto pending = send_slots_->take(seq);
+        if (pending) {
+          if (pending->buffer)
+            buffer_pool_->return_buffer(pending->buffer);
+          resume({ec, 0}, std::move(pending->callback));
+        }
+        return;
+      }
       if (buffer)
         buffer_pool_->return_buffer(buffer);
       resume({ec, 0}, std::move(callback));
       return;
     }
-    if (group_) {
-      // Shared JFC: completion is matched by seq, not by queue order. Check the
-      // window before moving the buffer into the slot so an overflow cannot
-      // leak it (urma_buffer_t has no RAII deleter).
-      if (!send_slots_ || send_slots_->in_flight() >= send_slots_->capacity()) {
-        if (buffer)
-          buffer_pool_->return_buffer(buffer);
-        resume({std::make_error_code(std::errc::no_buffer_space), 0},
-               std::move(callback));
-        return;
-      }
-      send_slots_->push(
-          seq, pending_send{std::move(buffer), length, std::move(callback)});
-      return;
-    }
+    if (group_)
+      return;  // already reserved above
     send_callbacks_.push(
         pending_send{std::move(buffer), length, std::move(callback)});
   }
@@ -466,6 +484,11 @@ struct urma_socket_shared_state_t
     int count = 0;
     std::size_t polled = 0;
     do {
+      // A completion handler may close the socket (protocol error, peer close,
+      // recv queue exhaustion): stop draining this batch instead of dispatching
+      // the remaining CQEs to a closed socket.
+      if (has_close_.load())
+        return {{}, polled};
       count = urma_poll_jfc(jfc(), static_cast<int>(completions.size()),
                             completions.data());
       if (count < 0)
@@ -535,11 +558,20 @@ struct urma_socket_shared_state_t
     }
     if (cr.completion_len == 0) {
       peer_close_ = true;
-      has_close_ = true;
+      // The zero-length completion consumed one posted recv buffer: give it
+      // back so the in-flight accounting stays consistent until
+      // release_resources().
+      if (!recv_queue_.empty()) {
+        auto buffer = recv_queue_.pop();
+        buffer_pool_->return_buffer(buffer);
+      }
       if (recv_callback_) {
         resume({std::make_error_code(std::errc::connection_reset), 0},
                std::move(recv_callback_));
       }
+      // Go through close() so the socket detaches from its group and settles
+      // its pending sends (setting has_close_ directly used to skip both).
+      close();
       return;
     }
     auto completed_buffer = recv_queue_.pop();
@@ -830,7 +862,8 @@ struct urma_socket_shared_state_t
   void start_completion_watch() {
     if (group_) {
       ELOG_INFO << "URMA completion detection: mode=shared-jfc-poll"
-                << ", sid=" << group_sid_ << ", jfc_depth=" << group_->cq_size()
+                << ", sid=" << group_sid_.load()
+                << ", jfc_depth=" << group_->cq_size()
                 << ", io_rate=" << io_rate_;
       group_->ensure_polling();
       return;
@@ -888,15 +921,13 @@ struct urma_socket_shared_state_t
     }
     if (send_slots_) {
       // Shared JFC: settle every in-flight send slot (buffer + callback) so a
-      // closing socket does not leak them.
-      for (uint32_t seq = 0; seq < send_slots_->capacity(); ++seq) {
-        auto pending = send_slots_->take(seq);
-        if (!pending)
-          continue;
-        if (pending->buffer)
-          buffer_pool_->return_buffer(pending->buffer);
-        resume({ec, 0}, std::move(pending->callback));
-      }
+      // closing socket does not leak them. drain_each visits every live slot,
+      // so sequence holes cannot strand an entry.
+      send_slots_->drain_each([this, ec](pending_send&& pending) {
+        if (pending.buffer)
+          buffer_pool_->return_buffer(pending.buffer);
+        resume({ec, 0}, std::move(pending.callback));
+      });
     }
     wake_writer(ec);
   }
@@ -910,20 +941,24 @@ struct urma_socket_shared_state_t
   }
 
   void close() {
-    if (has_close_.exchange(true))
-      return;
-    std::error_code ignored;
-    poll_timer_.cancel();
-    if (event_fd_)
-      event_fd_->cancel(ignored);
-    socket_.cancel(ignored);
-    socket_.close(ignored);
-    if (group_ && group_sid_ >= 0) {
-      // Stop group dispatch to this socket before tearing its resources down.
-      group_->detach(group_sid_);
-      group_sid_ = -1;
+    const bool first = !has_close_.exchange(true);
+    if (first) {
+      std::error_code ignored;
+      poll_timer_.cancel();
+      if (event_fd_)
+        event_fd_->cancel(ignored);
+      socket_.cancel(ignored);
+      socket_.close(ignored);
     }
-    fail_pending(std::make_error_code(std::errc::operation_canceled));
+    // Detach exactly once on every path that reaches close(), including the
+    // peer-close path (which used to set has_close_ directly and therefore
+    // never detached, leaving the group's CQ reservation stuck and its pending
+    // sends unsettled).
+    const int sid = group_sid_.exchange(-1);
+    if (group_ && sid >= 0)
+      group_->detach(sid);
+    if (first)
+      fail_pending(std::make_error_code(std::errc::operation_canceled));
   }
 
   void release_resources() {
@@ -956,7 +991,7 @@ struct urma_socket_shared_state_t
   // last in release_resources(), after jetty_/jfr_, so the group's JFC is
   // destroyed after the jetties that feed it.
   std::shared_ptr<urma_jfc_group> group_;
-  int group_sid_ = -1;
+  std::atomic<int> group_sid_{-1};
   bool shared_jfc_ = false;
   uint32_t group_cq_size_ = 2048;
   uint32_t send_seq_ = 0;

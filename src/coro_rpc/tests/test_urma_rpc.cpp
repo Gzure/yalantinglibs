@@ -446,6 +446,70 @@ TEST_CASE("urma jfc group registry dispatches by socket id") {
   CHECK(raw_a->errors == 1);
 }
 
+TEST_CASE("urma jfc group registry never reuses a socket id") {
+  using coro_io::detail::jfc_group_registry;
+  using coro_io::detail::urma_ctx_op;
+
+  jfc_group_registry registry(/*max_wr=*/512);
+  auto old_socket = std::make_shared<mock_group_socket>();
+  const int old_sid = registry.attach(old_socket, 64);
+  REQUIRE(old_sid >= 0);
+  auto stale_cr = make_group_cr(urma_ctx_op::send, old_sid, 1);
+  CHECK(registry.detach(old_sid));
+
+  auto new_socket = std::make_shared<mock_group_socket>();
+  const int new_sid = registry.attach(new_socket, 64);
+  REQUIRE(new_sid >= 0);
+  // A completion of the detached socket must not be dispatched to the next
+  // socket, which is why ids are monotonic instead of reusing free slots.
+  CHECK(new_sid != old_sid);
+  CHECK_FALSE(registry.dispatch(stale_cr));
+  CHECK(new_socket->sends == 0);
+}
+
+TEST_CASE(
+    "urma jfc group registry prunes dead sockets and rejects bad records") {
+  using coro_io::detail::jfc_group_registry;
+  using coro_io::detail::urma_ctx_op;
+
+  jfc_group_registry registry(/*max_wr=*/512);
+  {
+    auto dead = std::make_shared<mock_group_socket>();
+    REQUIRE(registry.attach(dead, 256) >= 0);
+  }  // destroyed without detach: attach() must prune the reservation
+  auto live = std::make_shared<mock_group_socket>();
+  const int sid = registry.attach(live, 256);
+  CHECK(sid >= 0);
+  CHECK(registry.used_wr() == 256);
+  CHECK(registry.size() == 1);
+
+  // Invalid inputs are dropped instead of being misdispatched.
+  CHECK(registry.attach(nullptr, 16) == -1);
+  urma_cr_t empty_ctx{};
+  CHECK_FALSE(registry.dispatch(empty_ctx));
+  urma_cr_t bad_op{};
+  bad_op.user_ctx =
+      coro_io::detail::encode_ctx(static_cast<coro_io::detail::urma_ctx_op>(9),
+                                  static_cast<uint32_t>(sid), 1);
+  CHECK_FALSE(registry.dispatch(bad_op));
+
+  // max_wr == 0 means "no capacity accounting".
+  jfc_group_registry unbounded(/*max_wr=*/0);
+  CHECK(unbounded.attach(std::make_shared<mock_group_socket>(), 1000000) >= 0);
+}
+
+TEST_CASE("urma seq slot ring rejects a completion whose seq tag differs") {
+  coro_io::detail::seq_slot_ring<int> ring(8);
+  CHECK(ring.push(1, 11));
+  // 9 % 8 == 1 but the slot belongs to seq 1: a stale completion must not take
+  // it.
+  CHECK_FALSE(ring.take(9).has_value());
+  CHECK(ring.in_flight() == 1);
+  auto v1 = ring.take(1);
+  REQUIRE(v1.has_value());
+  CHECK(*v1 == 11);
+}
+
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {
   scoped_env_var enable("URMA_RPC_ENABLE", "0");
 

@@ -49,7 +49,7 @@ namespace coro_io::detail {
 // that). Encode it in the work request's user_ctx instead:
 //
 //   bits 63..60 : op (0 = send, 1 = recv)
-//   bits 59..32 : socket id inside the group (28 bits)
+//   bits 59..32 : socket id inside the group (28 bits, never reused)
 //   bits 31..0  : per-socket sequence for send WRs, or recv sequence for recv
 //
 // ---------------------------------------------------------------------------
@@ -74,15 +74,17 @@ inline decoded_ctx decode_ctx(uint64_t value) noexcept {
                      static_cast<uint32_t>(value & 0xFFFFFFFF)};
 }
 
+inline bool is_valid_ctx_op(urma_ctx_op op) noexcept {
+  return op == urma_ctx_op::send || op == urma_ctx_op::recv;
+}
+
 // ---------------------------------------------------------------------------
 // Fixed-capacity ring of move-only work items keyed by a 32-bit sequence.
 //
 // With a shared JFC, send completions from different sockets interleave, so the
 // previous "pop the front of the FIFO" match is no longer valid. Keep the
 // pending send descriptors in a slot ring indexed by seq % capacity and look
-// the completion up by seq. The in-flight window is bounded by capacity() (the
-// send buffer count), so a seq can never collide with a stale slot in practice;
-// the tag check makes a collision harmless anyway.
+// the completion up by seq.
 // ---------------------------------------------------------------------------
 template <typename T>
 class seq_slot_ring {
@@ -93,9 +95,10 @@ class seq_slot_ring {
   std::size_t capacity() const noexcept { return slots_.size(); }
   std::size_t in_flight() const noexcept { return in_flight_; }
 
-  // Returns false when the slot is already occupied (caller must treat it as a
-  // window overflow and fail the send instead of dropping the buffer).
-  bool push(uint32_t seq, T value) {
+  // Reserves the slot for seq and moves the value in on success. On failure the
+  // value is left untouched (NOT consumed), so the caller can still return its
+  // buffer / resume its callback: urma_buffer_t has no RAII deleter.
+  bool push(uint32_t seq, T&& value) {
     if (slots_.empty())
       return false;
     const std::size_t idx = seq % slots_.size();
@@ -124,6 +127,20 @@ class seq_slot_ring {
       return false;
     const std::size_t idx = seq % slots_.size();
     return slots_[idx].has_value() && tags_[idx] == seq;
+  }
+
+  // Visits every live entry (used to settle a closing socket). Entries whose
+  // seq is not congruent to their index modulo capacity are still visited, so
+  // sequence holes cannot strand a pending send.
+  template <typename Fn>
+  void drain_each(Fn&& fn) {
+    for (auto& slot : slots_) {
+      if (!slot.has_value())
+        continue;
+      fn(std::move(*slot));
+      slot.reset();
+    }
+    in_flight_ = 0;
   }
 
   void clear() {
@@ -155,6 +172,10 @@ class jfc_group_socket {
 // Socket table of one JFC group, with the completion dispatch. Kept free of
 // URMA control-plane calls so it can be unit-tested without a device.
 //
+// Socket ids are monotonic and never reused. A completion that arrives for a
+// socket that already detached therefore cannot be dispatched to a different
+// (new) socket that happened to get the same slot.
+//
 // Thread-safety: attach/detach may come from any thread (socket close paths);
 // dispatch runs on the owning io_context thread. Lookups copy the strong
 // pointer under the lock and call the socket outside it, so a callback can
@@ -165,60 +186,53 @@ class jfc_group_registry {
   jfc_group_registry() = default;
   explicit jfc_group_registry(std::size_t max_wr) : max_wr_(max_wr) {}
 
-  // Returns the sid (>= 0), -1 when the group is full, or -2 when the work
-  // request reserve does not fit into the remaining CQ depth.
+  // Returns the sid (>= 0), -1 when the socket is invalid or the sid space is
+  // exhausted, or -2 when the work request reserve does not fit into the
+  // remaining CQ depth.
   int attach(std::shared_ptr<jfc_group_socket> socket, uint32_t wr_reserve) {
     if (!socket)
       return -1;
     std::lock_guard<std::mutex> lock(mutex_);
+    prune_expired_locked();
     if (max_wr_ != 0 && used_wr_ + wr_reserve > max_wr_)
       return -2;
-    std::size_t sid = static_cast<std::size_t>(-1);
-    for (std::size_t i = 0; i < slots_.size(); ++i) {
-      if (slots_[i].expired()) {
-        sid = i;
-        break;
-      }
-    }
-    if (sid == static_cast<std::size_t>(-1)) {
-      sid = slots_.size();
-      if (sid >= kMaxSockets)
-        return -1;
-      slots_.emplace_back();
-      reserved_.push_back(0);
-    }
-    slots_[sid] = std::move(socket);
-    reserved_[sid] = wr_reserve;
+    if (next_sid_ >= kMaxSockets)
+      return -1;
+    const uint32_t sid = next_sid_++;
+    slots_[sid] = slot{std::move(socket), wr_reserve};
     used_wr_ += wr_reserve;
     return static_cast<int>(sid);
   }
 
   bool detach(int sid) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (sid < 0 || static_cast<std::size_t>(sid) >= slots_.size())
+    if (sid < 0)
       return false;
-    const auto idx = static_cast<std::size_t>(sid);
-    if (slots_[idx].expired())
+    auto it = slots_.find(static_cast<uint32_t>(sid));
+    if (it == slots_.end())
       return false;
-    slots_[idx].reset();
-    if (used_wr_ >= reserved_[idx])
-      used_wr_ -= reserved_[idx];
-    reserved_[idx] = 0;
+    if (used_wr_ >= it->second.reserve)
+      used_wr_ -= it->second.reserve;
+    slots_.erase(it);
     return true;
   }
 
   // Dispatches one completion record. Returns false for an unknown / expired
-  // sid (a completion of a socket that already closed) so the caller can drop
-  // it silently.
+  // sid (a completion of a socket that already closed), an unknown op, or a
+  // completion whose user_ctx was not filled in by the driver.
   bool dispatch(const urma_cr_t& cr) {
+    if (cr.user_ctx == 0)
+      return false;
     const auto ctx = decode_ctx(cr.user_ctx);
+    if (!is_valid_ctx_op(ctx.op))
+      return false;
     std::shared_ptr<jfc_group_socket> socket;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      const auto sid = static_cast<std::size_t>(ctx.sid);
-      if (sid >= slots_.size())
+      auto it = slots_.find(ctx.sid);
+      if (it == slots_.end())
         return false;
-      socket = slots_[sid].lock();
+      socket = it->second.weak.lock();
     }
     if (!socket)
       return false;
@@ -232,8 +246,8 @@ class jfc_group_registry {
   std::size_t size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::size_t count = 0;
-    for (const auto& slot : slots_)
-      if (!slot.expired())
+    for (const auto& [sid, entry] : slots_)
+      if (!entry.weak.expired())
         ++count;
     return count;
   }
@@ -248,8 +262,8 @@ class jfc_group_registry {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       sockets.reserve(slots_.size());
-      for (const auto& slot : slots_)
-        if (auto socket = slot.lock())
+      for (auto& [sid, entry] : slots_)
+        if (auto socket = entry.weak.lock())
           sockets.push_back(std::move(socket));
     }
     for (auto& socket : sockets) fn(*socket);
@@ -258,7 +272,6 @@ class jfc_group_registry {
   void clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     slots_.clear();
-    reserved_.clear();
     used_wr_ = 0;
   }
 
@@ -268,12 +281,32 @@ class jfc_group_registry {
     max_wr_ = max_wr;
   }
 
-  static constexpr std::size_t kMaxSockets = 0x0FFFFFFF;
+  static constexpr uint32_t kMaxSockets = 0x0FFFFFFF;
 
  private:
+  struct slot {
+    std::weak_ptr<jfc_group_socket> weak;
+    uint32_t reserve = 0;
+  };
+
+  // Drops entries whose socket died without detaching, so their CQ reservation
+  // cannot block every future attach.
+  void prune_expired_locked() {
+    for (auto it = slots_.begin(); it != slots_.end();) {
+      if (it->second.weak.expired()) {
+        if (used_wr_ >= it->second.reserve)
+          used_wr_ -= it->second.reserve;
+        it = slots_.erase(it);
+      }
+      else {
+        ++it;
+      }
+    }
+  }
+
   mutable std::mutex mutex_;
-  std::vector<std::weak_ptr<jfc_group_socket>> slots_;
-  std::vector<uint32_t> reserved_;
+  std::map<uint32_t, slot> slots_;
+  uint32_t next_sid_ = 0;
   std::size_t used_wr_ = 0;
   std::size_t max_wr_ = 0;
 };
@@ -300,18 +333,28 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     }
   };
 
+  // executor and urma_context together identify a group: one io_context may in
+  // principle carry sockets from different devices.
   static std::shared_ptr<urma_jfc_group> get(
       coro_io::ExecutorWrapper<>* executor, urma_context_t* context,
       uint32_t cq_size, uint32_t max_cq_depth, uint32_t io_rate) {
     if (!executor || !context)
       return nullptr;
-    auto* key = static_cast<void*>(&executor->get_asio_executor().context());
+    const auto key = std::make_pair(
+        static_cast<void*>(&executor->get_asio_executor().context()),
+        static_cast<void*>(context));
     std::lock_guard<std::mutex> lock(registry_mutex());
     auto& groups = registry();
+    prune_expired_locked(groups);
     auto it = groups.find(key);
     if (it != groups.end()) {
-      if (auto existing = it->second.lock())
-        return existing;
+      if (auto existing = it->second.lock()) {
+        if (!existing->failed_.load(std::memory_order_relaxed))
+          return existing;
+        // A failed group must not be handed to new sockets: they would never
+        // see completions. Drop the reference and build a fresh one.
+        it->second.reset();
+      }
     }
     auto group =
         std::shared_ptr<urma_jfc_group>(new urma_jfc_group(executor, io_rate));
@@ -321,43 +364,74 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return group;
   }
 
-  ~urma_jfc_group() { alive_.store(false, std::memory_order_relaxed); }
+  ~urma_jfc_group() { stop(); }
 
   bool valid() const noexcept { return static_cast<bool>(jfc_); }
+
   urma_jfc_t* jfc() const noexcept { return jfc_.get(); }
   uint32_t cq_size() const noexcept { return cq_size_; }
 
   // wr_reserve: work requests this socket may keep in flight (send + recv
   // buffers + slack). Returns sid, or < 0 on failure (group full / CQ too
-  // small).
+  // small / group already failed).
   int attach(std::shared_ptr<jfc_group_socket> socket, uint32_t wr_reserve) {
-    return registry_.attach(std::move(socket), wr_reserve);
+    if (failed_.load(std::memory_order_relaxed))
+      return -3;
+    const int sid = registry_.attach(std::move(socket), wr_reserve);
+    if (sid < 0)
+      return sid;
+    socket_count_.fetch_add(1, std::memory_order_relaxed);
+    // Restart the loop if the last detach stopped it. Holding the same mutex as
+    // the self-stop path closes the "attach vs self-stop" window.
+    std::lock_guard<std::mutex> lock(registry_mutex());
+    if (failed_.load(std::memory_order_relaxed)) {
+      // The group failed while we were attaching: drop the reservation instead
+      // of handing out a socket that would never see completions.
+      registry_.detach(sid);
+      socket_count_.fetch_sub(1, std::memory_order_relaxed);
+      return -3;
+    }
+    alive_.store(true, std::memory_order_relaxed);
+    if (!polling_.exchange(true, std::memory_order_relaxed))
+      schedule_locked();
+    return sid;
   }
 
-  void detach(int sid) { registry_.detach(sid); }
+  void detach(int sid) {
+    if (registry_.detach(sid))
+      socket_count_.fetch_sub(1, std::memory_order_relaxed);
+  }
 
-  // Starts the single poll tick for this io_context (idempotent). Must be
-  // called from the owning io_context thread.
+  // Starts the single poll tick for this io_context (idempotent).
   void ensure_polling() {
-    if (!valid())
-      return;
-    bool expected = false;
-    if (!polling_.compare_exchange_strong(expected, true))
+    if (!valid() || failed_.load(std::memory_order_relaxed))
       return;
     alive_.store(true, std::memory_order_relaxed);
-    schedule();
+    if (!polling_.exchange(true, std::memory_order_relaxed))
+      schedule();
   }
 
-  // Stops the tick. Safe to call from any thread; in-flight dispatches finish
-  // on the io_context thread.
-  void stop() { alive_.store(false, std::memory_order_relaxed); }
+  // Stops the tick and marks the group unusable. Safe to call from any thread;
+  // in-flight dispatches finish on the io_context thread.
+  void stop() {
+    alive_.store(false, std::memory_order_relaxed);
+    polling_.store(false, std::memory_order_relaxed);
+    failed_.store(true, std::memory_order_relaxed);
+  }
 
   bool polling() const noexcept {
     return polling_.load(std::memory_order_relaxed);
   }
-  std::size_t socket_count() const { return registry_.size(); }
+  bool failed() const noexcept {
+    return failed_.load(std::memory_order_relaxed);
+  }
+  std::size_t socket_count() const {
+    return socket_count_.load(std::memory_order_relaxed);
+  }
 
  private:
+  using key_type = std::pair<void*, void*>;
+
   urma_jfc_group(coro_io::ExecutorWrapper<>* executor, uint32_t io_rate)
       : executor_(executor), io_rate_(std::max<uint32_t>(io_rate, 1)) {}
 
@@ -388,6 +462,14 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   }
 
   void schedule() {
+    auto self = shared_from_this();
+    asio::post(executor_->get_asio_executor(), [self] {
+      self->poll_once();
+    });
+  }
+
+  // Caller holds registry_mutex().
+  void schedule_locked() {
     if (!alive_.load(std::memory_order_relaxed))
       return;
     auto self = shared_from_this();
@@ -397,11 +479,13 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   }
 
   void poll_once() {
-    if (!alive_.load(std::memory_order_relaxed))
+    if (!alive_.load(std::memory_order_relaxed) ||
+        failed_.load(std::memory_order_relaxed))
       return;
     std::array<urma_cr_t, 16> completions{};
     for (std::size_t round = 0; round < io_rate_; ++round) {
-      if (!alive_.load(std::memory_order_relaxed))
+      if (!alive_.load(std::memory_order_relaxed) ||
+          failed_.load(std::memory_order_relaxed))
         return;
       int count = urma_poll_jfc(
           jfc_.get(), static_cast<int>(completions.size()), completions.data());
@@ -410,23 +494,23 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
         return;
       }
       for (int i = 0; i < count; ++i) {
-        if (!registry_.dispatch(completions[i])) {
-          // Completion of a socket that already detached: the buffer pool is
-          // device-global, and the detached socket returned its own buffers, so
-          // there is nothing to reclaim here. Count it so a leak of stale
-          // completions is visible.
+        if (!registry_.dispatch(completions[i]))
           ++stale_completions_;
-        }
       }
     }
-    if (registry_.size() == 0) {
-      // No attached socket: let the group be destroyed instead of keeping
-      // itself alive through the posted tick. ensure_polling() restarts the
-      // loop if a socket attaches again.
-      ELOG_INFO << "URMA shared JFC poll loop stopped: no sockets attached";
-      alive_.store(false, std::memory_order_relaxed);
-      polling_.store(false, std::memory_order_relaxed);
-      return;
+    // No attached socket: let the group be destroyed instead of keeping itself
+    // alive through the posted tick. attach() restarts the loop.
+    if (socket_count_.load(std::memory_order_relaxed) == 0) {
+      std::lock_guard<std::mutex> lock(registry_mutex());
+      if (socket_count_.load(std::memory_order_relaxed) == 0) {
+        if (stale_completions_ != 0) {
+          ELOG_INFO << "URMA shared JFC: dropped " << stale_completions_
+                    << " completion(s) for detached sockets";
+        }
+        alive_.store(false, std::memory_order_relaxed);
+        polling_.store(false, std::memory_order_relaxed);
+        return;
+      }
     }
     schedule();
   }
@@ -435,10 +519,21 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     ELOG_ERROR << "URMA shared JFC poll failed: " << ec.message()
                << "; failing " << registry_.size() << " socket(s)";
     alive_.store(false, std::memory_order_relaxed);
-    polling_failure_reported_ = true;
+    polling_.store(false, std::memory_order_relaxed);
+    failed_.store(true, std::memory_order_relaxed);
     registry_.for_each([ec](jfc_group_socket& socket) {
       socket.on_group_error(ec);
     });
+  }
+
+  static void prune_expired_locked(
+      std::map<key_type, std::weak_ptr<urma_jfc_group>>& groups) {
+    for (auto it = groups.begin(); it != groups.end();) {
+      if (it->second.expired())
+        it = groups.erase(it);
+      else
+        ++it;
+    }
   }
 
   static std::mutex& registry_mutex() {
@@ -446,8 +541,9 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return *value;
   }
 
-  static std::map<void*, std::weak_ptr<urma_jfc_group>>& registry() {
-    static auto* value = new std::map<void*, std::weak_ptr<urma_jfc_group>>();
+  static std::map<key_type, std::weak_ptr<urma_jfc_group>>& registry() {
+    static auto* value =
+        new std::map<key_type, std::weak_ptr<urma_jfc_group>>();
     return *value;
   }
 
@@ -458,8 +554,9 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   uint32_t cq_size_ = 0;
   std::atomic<bool> polling_{false};
   std::atomic<bool> alive_{true};
-  std::atomic<uint64_t> stale_completions_{0};
-  bool polling_failure_reported_ = false;
+  std::atomic<bool> failed_{false};
+  std::atomic<std::size_t> socket_count_{0};
+  std::size_t stale_completions_ = 0;
 };
 
 }  // namespace coro_io::detail

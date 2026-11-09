@@ -225,6 +225,30 @@ TEST_CASE("urma rpc env pending poll budget and jfc moderation") {
   }
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // Poll rounds per io_context yield: the I/O share of the reactor loop.
+    CHECK(config.io_rate == 8);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var rate("URMA_RPC_IO_RATE", "64");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.io_rate == 64);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var rate("URMA_RPC_IO_RATE", "4096");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.io_rate == 1024);  // clamped to the supported range
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var rate("URMA_RPC_IO_RATE", "0");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.io_rate == 1);  // 0 would mean "never poll"
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
     scoped_env_var pending("URMA_RPC_PENDING_POLL_BUDGET", "8");
     scoped_env_var count("URMA_RPC_JFC_MODERATE_COUNT", "-1");
     scoped_env_var period("URMA_RPC_JFC_MODERATE_PERIOD", "50");

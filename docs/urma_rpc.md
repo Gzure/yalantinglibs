@@ -116,7 +116,8 @@ export URMA_RPC_EID_INDEX=0
 | `URMA_RPC_PENDING_POLL_BUDGET` | 事件唤醒后、**仍有在途 send/recv 回调**时的空轮询预算，默认 `1`（实际 `budget+1` 次）：事件已被 jfce fd 交付，抽干即回到 rearm+wait；保留 1 次是为了覆盖"CQE 落在最后一次抽干与 rearm 之间"的窗口。设为 `0` 用于极限压测 |
 | `URMA_RPC_JFC_MODERATE_COUNT` / `URMA_RPC_JFC_MODERATE_PERIOD` | JFC 完成事件合并参数（`urma_modify_jfc`），默认 `1` / `-1`：`count=1` 让每个 CQE 立刻产生事件，`period` 保留驱动默认。驱动默认合并会把 JFCE 唤醒延迟抬到 `moderate_period` 量级（实测 50~300µs），对 13~20µs RTT 目标是致命的；任一字段设 `-1` 表示该字段沿用驱动默认（A/B 对照）。**吞吐提示**：`count=1` 下 jfce 事件数随 CQE 线性增长，极高吞吐场景可改用 `count=16`/`period=10` 或 `-1`/`-1` |
 | `URMA_RPC_POLL_INTERVAL` | timer 兜底路径的轮询间隔，单位微秒 |
-| `URMA_RPC_POLL_SPIN` | timer 兜底路径（`URMA_RPC_EVENT_MODE=0`）的轮询方式，默认 `1`：在 reactor 线程内连续轮询（每 8 轮让出一次 io_context），不再为每个 5µs tick arm `asio::steady_timer`。单次轮询是用户态 `udma_u_poll_jfc`，而一次 timer tick 是 2 次 `timerfd_settime` + 1 次 epoll 唤醒（≈3.5µs CPU / 5µs 周期/连接）。代价：持有 timer 模式 socket 的 reactor 线程会占满一个核。设 `0` 恢复原 timer 节奏（空闲省 CPU，但保留 timerfd 风暴） |
+| `URMA_RPC_POLL_SPIN` | timer 兜底路径（`URMA_RPC_EVENT_MODE=0`）的轮询方式，默认 `1`：在 reactor 线程内连续轮询（每 `URMA_RPC_IO_RATE` 轮让出一次 io_context），不再为每个 5µs tick arm `asio::steady_timer`。单次轮询是用户态 `udma_u_poll_jfc`，而一次 timer tick 是 2 次 `timerfd_settime` + 1 次 epoll 唤醒（≈3.5µs CPU / 5µs 周期/连接）。代价：持有 timer 模式 socket 的 reactor 线程会占满一个核。设 `0` 恢复原 timer 节奏（空闲省 CPU，但保留 timerfd 风暴） |
+| `URMA_RPC_IO_RATE` | spin 模式下**每让出一次 io_context 前连续 poll 的轮数**（1~1024，默认 `8`），等价于 Netty `ioRatio` 的思想：越大 → I/O 轮询占比越高、完成检测越及时，但 handler/fd/timer 处理越晚；独占用核场景可调大到 64~256，共享核保持 8~16 |
 
 **timer 兜底路径的取舍**：`URMA_RPC_POLL_SPIN=1`（默认）把完成检测延迟压到一次轮询（亚微秒），代价是每个含 timer 模式 socket 的 reactor 线程一个忙核——服务端用 `--rpc_thread_num` 限核，或设 `URMA_RPC_POLL_SPIN=0` 换回定时器。若目标是 13~20µs RTT，建议优先用事件模式（`URMA_RPC_EVENT_MODE=1`）；timer 路径是事件模式不可用时的兜底。
 

@@ -467,13 +467,15 @@ struct urma_socket_shared_state_t
       return;
     // A poll round is a userspace udma_u_poll_jfc, while a timer tick costs two
     // timerfd_settime plus an epoll wake-up (~3.5us of CPU for 5us of wall
-    // time, per socket). In spin mode keep polling inline for a few rounds and
-    // then yield to the io_context, so the timer machinery stays off the hot
-    // path and completion latency is one poll round. The cost is one busy core
-    // per reactor thread owning a timer-mode socket: bound it with
-    // --rpc_thread_num on the server, or set URMA_RPC_POLL_SPIN=0 to get the
-    // timer cadence back.
-    const std::size_t inline_rounds = poll_spin_ ? kPollInlineBatch : 1;
+    // time, per socket). In spin mode keep polling inline for io_rate_ rounds
+    // (Netty ioRatio analogue: more rounds spend more time in I/O polling, so
+    // completion latency drops while handlers/fds/timers are serviced later)
+    // and then yield to the io_context once. The cost is one busy core per
+    // reactor thread owning a socket: bound it with --rpc_thread_num on the
+    // server, or set URMA_RPC_POLL_SPIN=0 to get the timer cadence back.
+    const std::size_t inline_rounds =
+        poll_spin_ ? static_cast<std::size_t>(std::max<uint32_t>(io_rate_, 1u))
+                   : 1;
     for (std::size_t round = 0; round < inline_rounds; ++round) {
       if (has_close_)
         return;
@@ -708,7 +710,8 @@ struct urma_socket_shared_state_t
               << ", pending_poll_budget=" << pending_poll_budget_
               << ", idle_busy_poll_budget=" << busy_poll_budget_
               << ", idle_poll_interval_us=" << idle_poll_interval_.count()
-              << ", timer_poll=" << (poll_spin_ ? "spin" : "timer");
+              << ", timer_poll=" << (poll_spin_ ? "spin" : "timer")
+              << ", io_rate=" << io_rate_;
     if (use_event) {
       // Tune moderation only once the jfce is actually consumed by this loop.
       apply_jfc_moderation();
@@ -820,6 +823,8 @@ struct urma_socket_shared_state_t
   static constexpr std::size_t max_active_poll_budget_ = 64;
   // Poll rounds executed inline before yielding to the io_context in spin mode.
   static constexpr std::size_t kPollInlineBatch = 8;
+  // Configurable version of kPollInlineBatch (URMA_RPC_IO_RATE).
+  uint32_t io_rate_ = kPollInlineBatch;
   // Upper bound on consecutive non-empty drain rounds per jfce event.
   static constexpr std::size_t kMaxDrainRounds = 64;
   std::size_t active_poll_budget_ = max_active_poll_budget_;
@@ -869,6 +874,11 @@ class urma_socket_t {
     // round, at the cost of one busy core per reactor thread that owns a
     // timer-mode socket. Set URMA_RPC_POLL_SPIN=0 to restore the timer cadence.
     bool poll_spin = true;
+    // Spin mode only: poll rounds executed inline before yielding to the
+    // io_context, i.e. the I/O-polling share of the reactor loop (Netty
+    // ioRatio analogue). Larger = more time polling = lower completion latency,
+    // but handlers/fds/timers are serviced later. 1..1024, default 8.
+    uint32_t io_rate = 8;
   };
 
   enum io_type { recv = 0, send = 1 };
@@ -1178,6 +1188,7 @@ class urma_socket_t {
     state_->jfc_moderate_period_ = conf_.jfc_moderate_period;
     state_->idle_poll_interval_ = conf_.poll_interval;
     state_->poll_spin_ = conf_.poll_spin;
+    state_->io_rate_ = conf_.io_rate;
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode,
                       conf_.jfs_priority, conf_.tp_type)) {
       auto stage = state_->init_stage_;

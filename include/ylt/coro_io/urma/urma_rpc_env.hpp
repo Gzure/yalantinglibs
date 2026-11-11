@@ -27,6 +27,7 @@
 #include <system_error>
 #include <type_traits>
 
+#include "ylt/coro_io/urma/urma_priority.hpp"
 #include "ylt/coro_io/urma/urma_socket.hpp"
 #include "ylt/easylog.hpp"
 
@@ -114,8 +115,8 @@ inline void urma_rpc_parse_env_tp_type(urma_tp_type_t& tp_type) {
     return;
   }
 
-  ELOG_WARN << "invalid MC_YLT_URMA_TP_TYPE value: " << value << "; use default "
-            << static_cast<int>(tp_type);
+  ELOG_WARN << "invalid MC_YLT_URMA_TP_TYPE value: " << value
+            << "; use default " << static_cast<int>(tp_type);
 }
 
 inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
@@ -149,8 +150,9 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
                              config.jfc_moderate_period);
   constexpr std::size_t max_pending_poll_budget = 4096;
   if (config.pending_poll_budget > max_pending_poll_budget) {
-    ELOG_WARN << "MC_YLT_URMA_PENDING_POLL_BUDGET=" << config.pending_poll_budget
-              << " is too large; clamped to " << max_pending_poll_budget
+    ELOG_WARN << "MC_YLT_URMA_PENDING_POLL_BUDGET="
+              << config.pending_poll_budget << " is too large; clamped to "
+              << max_pending_poll_budget
               << " (the reactor thread would otherwise spin for too long)";
     config.pending_poll_budget = max_pending_poll_budget;
   }
@@ -171,8 +173,14 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
     urma_rpc_parse_env_integer("MC_YLT_URMA_POLL_INTERVAL", interval_us);
     config.poll_interval = std::chrono::microseconds(interval_us);
   }
-  config.poll_spin = urma_rpc_env_flag("MC_YLT_URMA_POLL_SPIN", /*default*/ true);
+  config.poll_spin =
+      urma_rpc_env_flag("MC_YLT_URMA_POLL_SPIN", /*default*/ true);
 
+  {
+    uint64_t iyt = 64;
+    urma_rpc_parse_env_integer("MC_YLT_URMA_IDLE_YIELD_THRESHOLD", iyt);
+    config.idle_yield_threshold = static_cast<std::size_t>(iyt);
+  }
   return config;
 }
 
@@ -185,8 +193,9 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
                                 .max_memory_usage = config.max_memory_usage},
          .eid_index = config.eid_index});
     if (!device || !device->is_valid() || !device->get_buffer_pool()) {
-      ELOG_WARN << "MC_YLT_URMA_ENABLE is enabled but no usable URMA device was "
-                   "found; fall back to TCP";
+      ELOG_WARN
+          << "MC_YLT_URMA_ENABLE is enabled but no usable URMA device was "
+             "found; fall back to TCP";
       return std::nullopt;
     }
 

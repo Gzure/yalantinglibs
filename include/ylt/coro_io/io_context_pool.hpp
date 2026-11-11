@@ -26,11 +26,13 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -190,8 +192,11 @@ get_current_executor() {
 class io_context_pool {
  public:
   using executor_type = asio::io_context::executor_type;
-  explicit io_context_pool(std::size_t pool_size, bool cpu_affinity = false)
-      : next_io_context_(0), cpu_affinity_(cpu_affinity) {
+  explicit io_context_pool(std::size_t pool_size, bool cpu_affinity = false,
+                           std::vector<uint32_t> cpu_ids = {})
+      : next_io_context_(0),
+        cpu_affinity_(cpu_affinity),
+        cpu_ids_override_(std::move(cpu_ids)) {
     if (pool_size == 0) {
       pool_size = 1;  // set default value as 1
     }
@@ -217,9 +222,31 @@ class io_context_pool {
     }
 
 #ifdef __linux__
+    // CPU binding is configurable without an external launcher (numactl /
+    // taskset): YLT_IO_CONTEXT_CPU_LIST takes an explicit list ("116-131",
+    // "116,117,120-123") and implies affinity; YLT_IO_CONTEXT_CPU_AFFINITY
+    // (1/on/true) enables binding to the inherited affinity mask. An explicit
+    // list passed to the constructor wins over both.
     std::vector<uint32_t> cpu_ids;
-    const bool apply_cpu_affinity =
-        cpu_affinity_ && get_available_cpus(cpu_ids);
+    bool apply_cpu_affinity = false;
+    if (!cpu_ids_override_.empty()) {
+      cpu_ids = cpu_ids_override_;
+      apply_cpu_affinity = true;
+    }
+    else if (const char *list_env = std::getenv("YLT_IO_CONTEXT_CPU_LIST");
+             list_env && *list_env) {
+      if (parse_cpu_list(list_env, cpu_ids)) {
+        apply_cpu_affinity = true;
+      }
+      else {
+        std::cerr << "YLT_IO_CONTEXT_CPU_LIST=\"" << list_env
+                  << "\" is invalid; falling back to the process affinity "
+                     "mask\n";
+      }
+    }
+    if (!apply_cpu_affinity && (cpu_affinity_ || env_affinity_enabled())) {
+      apply_cpu_affinity = get_available_cpus(cpu_ids);
+    }
 #endif
 
     std::vector<std::shared_ptr<std::thread>> threads;
@@ -315,6 +342,43 @@ class io_context_pool {
   using work_type = asio::executor_work_guard<asio::io_context::executor_type>;
 
 #ifdef __linux__
+  static bool env_affinity_enabled() {
+    const char *env = std::getenv("YLT_IO_CONTEXT_CPU_AFFINITY");
+    if (!env || !*env)
+      return false;
+    std::string_view v(env);
+    return v == "1" || v == "on" || v == "true" || v == "TRUE";
+  }
+
+  // Parse a CPU list such as "116-131" or "116,117,120-123" (spaces allowed).
+  static bool parse_cpu_list(const char *text, std::vector<uint32_t> &ids) {
+    ids.clear();
+    const char *p = text;
+    while (*p) {
+      while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+      if (!*p)
+        break;
+      char *end = nullptr;
+      unsigned long first = std::strtoul(p, &end, 10);
+      if (end == p)
+        return false;
+      p = end;
+      unsigned long last = first;
+      if (*p == '-') {
+        ++p;
+        last = std::strtoul(p, &end, 10);
+        if (end == p)
+          return false;
+        p = end;
+      }
+      if (first > last || last >= CPU_SETSIZE)
+        return false;
+      for (unsigned long id = first; id <= last; ++id)
+        ids.push_back(static_cast<uint32_t>(id));
+    }
+    return !ids.empty();
+  }
+
   static bool get_available_cpus(std::vector<uint32_t> &ids) {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -349,6 +413,7 @@ class io_context_pool {
   std::atomic<bool> has_run_or_stop_ = false;
   std::once_flag flag_;
   bool cpu_affinity_ = false;
+  std::vector<uint32_t> cpu_ids_override_;
   inline static std::atomic<size_t> total_thread_num_ = 0;
 };
 

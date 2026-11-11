@@ -1,0 +1,12 @@
+flowchart TD
+    PUSH["任意线程 push op_queue_ 后<br/>scheduler.ipp:369-372"] --> W["wake_one_thread_and_unlock<br/>scheduler.ipp:668-680"]
+    W --> C1{"wait_usec_ == 0 ?"}
+    C1 -->|"是"| C2["maybe_unlock_and_signal_one<br/>返回 false（没有 condvar waiter）"]
+    C1 -->|"否"| C2
+    C2 --> R{"有线程睡在 wakeup_event_ 上 ?"}
+    R -->|"是"| SIG["pthread_cond_signal<br/>posix_event.hpp:86-99"]
+    R -->|"否：线程在 epoll_wait 里"| INT["task_interrupted_=true<br/>task_->interrupt()<br/>scheduler.ipp:671-678"]
+    INT --> ECTL["epoll_ctl MOD interrupter fd<br/>EPOLLIN | EPOLLERR | EPOLLET<br/>epoll_reactor.ipp:621-627"]
+    ECTL --> RET["epoll_wait 返回<br/>reactor 处理 interrupter 事件"]
+    SIG --> WAKE["do_run_one 从 condvar 返回<br/>重新检查队列"]
+    RET --> WAKE

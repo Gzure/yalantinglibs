@@ -117,6 +117,7 @@ export MC_YLT_URMA_EID_INDEX=0
 | `MC_YLT_URMA_JFC_MODERATE_COUNT` / `MC_YLT_URMA_JFC_MODERATE_PERIOD` | JFC 完成事件合并参数（`urma_modify_jfc`），默认 `1` / `-1`：`count=1` 让每个 CQE 立刻产生事件，`period` 保留驱动默认。驱动默认合并会把 JFCE 唤醒延迟抬到 `moderate_period` 量级（实测 50~300µs），对 13~20µs RTT 目标是致命的；任一字段设 `-1` 表示该字段沿用驱动默认（A/B 对照）。**吞吐提示**：`count=1` 下 jfce 事件数随 CQE 线性增长，极高吞吐场景可改用 `count=16`/`period=10` 或 `-1`/`-1` |
 | `MC_YLT_URMA_POLL_INTERVAL` | timer 兜底路径的轮询间隔，单位微秒 |
 | `MC_YLT_URMA_POLL_SPIN` | timer 兜底路径（`MC_YLT_URMA_EVENT_MODE=0`）的轮询方式，默认 `1`：在 reactor 线程内连续轮询（每 8 轮让出一次 io_context），不再为每个 5µs tick arm `asio::steady_timer`。单次轮询是用户态 `udma_u_poll_jfc`，而一次 timer tick 是 2 次 `timerfd_settime` + 1 次 epoll 唤醒（≈3.5µs CPU / 5µs 周期/连接）。代价：持有 timer 模式 socket 的 reactor 线程会占满一个核。设 `0` 恢复原 timer 节奏（空闲省 CPU，但保留 timerfd 风暴） |
+| `MC_YLT_URMA_IDLE_YIELD_THRESHOLD` | timer 兜底路径自旋模式的空闲让出阈值，默认 `64`：连续 `64` 个空轮询批次（每批 8 轮）后交给 timer 节奏；任意完成会清零计数，故有流量时仍保持忙轮询。设 `0` 关闭让出（纯忙轮询） |
 
 **timer 兜底路径的取舍**：`MC_YLT_URMA_POLL_SPIN=1`（默认）把完成检测延迟压到一次轮询（亚微秒），代价是每个含 timer 模式 socket 的 reactor 线程一个忙核——服务端用 `--rpc_thread_num` 限核，或设 `MC_YLT_URMA_POLL_SPIN=0` 换回定时器。若目标是 13~20µs RTT，建议优先用事件模式（`MC_YLT_URMA_EVENT_MODE=1`）；timer 路径是事件模式不可用时的兜底。
 

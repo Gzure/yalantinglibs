@@ -1,0 +1,23 @@
+stateDiagram-v2
+    state "Zero 计数为 0" as Zero
+    state "Positive 有未完成工作" as Positive
+    state "Stopped 已 stop（stopped_=true）" as Stopped
+
+    [*] --> Zero
+    Zero --> Positive: work_started（post 入队 / start_op / work_guard 构造 / tracked executor 拷贝）
+    Positive --> Positive: 继续 work_started 或 private 计数合并
+    Positive --> Stopped: work_finished 使计数归零 → stop_all_threads
+    Stopped --> Zero: restart() 只清 stopped_，计数仍是 0
+    Zero --> Exit: run/run_one/poll 入口发现计数 0 → stop() 并返回 0
+    Stopped --> Exit: do_run_one 的 while(!stopped_) 退出
+    Exit --> [*]
+
+    note right of Positive
+        run 循环继续
+        队列空则在 wakeup_event_ 上阻塞
+    end note
+    note right of Stopped
+        之后 run/run_one/poll 立即返回
+        队列中的 operation 不会被丢弃
+        但也不再执行
+    end note

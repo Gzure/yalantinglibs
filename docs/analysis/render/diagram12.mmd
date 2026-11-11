@@ -1,0 +1,12 @@
+flowchart LR
+    A["io_context_pool::stop()<br/>io_context_pool.hpp:261"] --> B["call_once<br/>:262"]
+    B --> C["ok = CAS has_run_or_stop_<br/>:263-264"]
+    C --> D["每个 wrapper schedule(clear_all_data)<br/>:266-270"]
+    D --> E["work_.clear()<br/>:272"]
+    E --> F["~executor_work_guard<br/>on_work_finished<br/>executor_work_guard.hpp:118-122"]
+    F --> G["scheduler::work_finished<br/>--outstanding_work_ == 0<br/>scheduler.hpp:105-109"]
+    G --> H["scheduler::stop()<br/>stop_all_threads<br/>scheduler.ipp:655-666"]
+    H --> I["do_run_one while(!stopped_) 退出<br/>scheduler.ipp:459"]
+    I --> J["各线程 run() 返回 → join<br/>io_context_pool.hpp:255-257"]
+    J --> K["promise_.set_value()<br/>:258"]
+    K --> L["stop() 中 promise.wait() 返回<br/>:282-283"]

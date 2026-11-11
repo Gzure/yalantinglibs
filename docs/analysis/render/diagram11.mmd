@@ -1,0 +1,16 @@
+stateDiagram-v2
+    state "Constructed 已构造" as Constructed
+    state "Running 已运行" as Running
+    state "Stopping 停止中" as Stopping
+    state "Stopped 已停止" as Stopped
+    state "StoppedNoRun 未 run 直接 stop" as StoppedNoRun
+
+    [*] --> Constructed
+    Constructed --> Running: run() CAS 成功，创建 N 线程
+    Constructed --> StoppedNoRun: stop() 时 CAS 成功 ok==true
+    Running --> Stopping: stop(force=false) 清 work_
+    Running --> Stopping: stop(force=true) 清 work_ 且 io_context stop()
+    Stopping --> Stopped: 各 run() 返回 → join → promise_.set_value()
+    StoppedNoRun --> [*]: poll() 清就绪 handler
+    Stopped --> [*]: 析构见 has_stop() 为真，不再 stop
+    Constructed --> [*]: 析构由 stop() 兜底

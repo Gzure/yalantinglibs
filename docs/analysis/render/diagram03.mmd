@@ -1,0 +1,39 @@
+flowchart TD
+    RUN["scheduler::run<br/>scheduler.ipp:200"] --> W0{"outstanding_work_ == 0 ?"}
+    W0 -->|"是"| EXIT0["stop(); return 0<br/>scheduler.ipp:203-207"]
+    W0 -->|"否"| SETUP["建立 thread_info + thread_call_stack::context<br/>scheduler.ipp:209-211"]
+    SETUP --> LOOP["do_run_one（持锁进入）<br/>scheduler.ipp:455"]
+
+    LOOP --> ST{"stopped_ ?"}
+    ST -->|"是"| RET0["return 0 → run 结束<br/>scheduler.ipp:524"]
+    ST -->|"否"| QE{"op_queue_ 为空 ?"}
+
+    QE -->|"是"| EMPTY{"wait_usec_ == 0 ?"}
+    EMPTY -->|"是"| SPIN["unlock 后立刻 lock<br/>忙等<br/>scheduler.ipp:508-512"]
+    EMPTY -->|"否"| CV["wakeup_event_.clear<br/>wakeup_event_.wait 阻塞<br/>scheduler.ipp:515-519"]
+    SPIN --> LOOP
+    CV -->|"被唤醒"| LOOP
+
+    QE -->|"否"| POP["o = front(); pop()<br/>more = !empty()<br/>scheduler.ipp:464-466"]
+    POP --> IS_TASK{"o == task_operation_ ?"}
+
+    IS_TASK -->|"是：轮到 reactor"| T1["task_interrupted_ = more || task_usec_ == 0<br/>scheduler.ipp:470"]
+    T1 --> T2{"more 且非单线程<br/>且 wait_usec_ != 0 ?"}
+    T2 -->|"是"| T3["unlock_and_signal_one<br/>叫醒另一个线程<br/>scheduler.ipp:472-473"]
+    T2 -->|"否"| T4["lock.unlock()<br/>scheduler.ipp:475"]
+    T3 --> T5["task_cleanup 守卫建立<br/>scheduler.ipp:477"]
+    T4 --> T5
+    T5 --> T6["task_->run(more?0:task_usec_, 私有队列)<br/>= epoll_wait<br/>scheduler.ipp:483"]
+    T6 --> T7["task_cleanup 析构：重新加锁<br/>私有队列整链并入 op_queue_<br/>task_operation_ 重新入队尾<br/>scheduler.ipp:56-79"]
+    T7 --> LOOP
+
+    IS_TASK -->|"否：用户 operation"| O1["task_result = o->task_result_<br/>scheduler.ipp:488"]
+    O1 --> O2{"more 且非单线程 ?"}
+    O2 -->|"是"| O3["wake_one_thread_and_unlock<br/>scheduler.ipp:490-491"]
+    O2 -->|"否"| O4["lock.unlock()<br/>scheduler.ipp:493"]
+    O3 --> O5["work_cleanup 守卫建立<br/>scheduler.ipp:496"]
+    O4 --> O5
+    O5 --> O6["o->complete(this, ec, task_result)<br/>执行 handler，可能 delete op<br/>scheduler.ipp:500"]
+    O6 --> O7["work_cleanup 析构：结算 work 计数<br/>私有队列并入全局<br/>scheduler.ipp:81-109"]
+    O7 --> O8["return 1<br/>scheduler.ipp:503"]
+    O8 --> LOOP

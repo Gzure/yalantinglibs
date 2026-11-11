@@ -34,8 +34,6 @@
 #include <system_error>
 #include <utility>
 
-#include "ylt/coro_io/urma/urma_priority.hpp"
-
 #include "asio/dispatch.hpp"
 #include "asio/ip/address.hpp"
 #include "asio/ip/tcp.hpp"
@@ -52,6 +50,7 @@
 #include "ylt/coro_io/urma/urma_benchmark_profile.hpp"
 #include "ylt/coro_io/urma/urma_buffer.hpp"
 #include "ylt/coro_io/urma/urma_device.hpp"
+#include "ylt/coro_io/urma/urma_priority.hpp"
 #include "ylt/easylog.hpp"
 #include "ylt/struct_pack.hpp"
 
@@ -491,11 +490,9 @@ struct urma_socket_shared_state_t
     // timerfd_settime plus an epoll wake-up (~3.5us of CPU for 5us of wall
     // time, per socket). In spin mode keep polling inline for a few rounds and
     // then yield to the io_context, so the timer machinery stays off the hot
-    // path and completion latency is one poll round. The cost is one busy core
-    // per reactor thread owning a timer-mode socket: bound it with
-    // --rpc_thread_num on the server, or set MC_YLT_URMA_POLL_SPIN=0 to get the
-    // timer cadence back.
+    // path and completion latency is one poll round.
     const std::size_t inline_rounds = poll_spin_ ? kPollInlineBatch : 1;
+    bool saw_completion = false;
     for (std::size_t round = 0; round < inline_rounds; ++round) {
       if (has_close_)
         return;
@@ -505,6 +502,8 @@ struct urma_socket_shared_state_t
         close();
         return;
       }
+      if (completion_count > 0)
+        saw_completion = true;
       if (poll_spin_)
         continue;
       // Timer cadence (MC_YLT_URMA_POLL_SPIN=0): after an active burst, or when
@@ -515,6 +514,27 @@ struct urma_socket_shared_state_t
         return;
       }
       --active_poll_budget_;
+    }
+    // Spin mode: keep re-posting (busy) while completions keep flowing. Only
+    // after kIdleYieldThreshold CONSECUTIVE empty inline batches -- sustained
+    // idle -- hand the thread to the timer cadence (start_polling) instead of
+    // re-posting forever. Any completion resets the counter, so under load the
+    // loop stays busy-spin and latency is unchanged (hysteresis avoids v1's
+    // single-empty-batch 5us hit). On sustained idle the reactor blocks in
+    // epoll_wait on the timerfd, so a SCHED_FIFO reactor no longer burns 100%
+    // of a core on a low-duty socket and no longer exhausts the RT runtime
+    // quota (sched_rt_runtime_us): RT becomes optional and the -1 throttle
+    // workaround is no longer required. MC_YLT_URMA_POLL_INTERVAL tunes the
+    // wake cadence; MC_YLT_URMA_POLL_SPIN=0 forces pure timer cadence.
+    if (poll_spin_ && idle_yield_threshold_ > 0) {
+      if (saw_completion) {
+        idle_yield_count_ = 0;
+      }
+      else if (++idle_yield_count_ >= idle_yield_threshold_) {
+        idle_yield_count_ = 0;
+        start_polling();
+        return;
+      }
     }
     auto self = shared_from_this();
     asio::post(executor_->get_asio_executor(), [self] {
@@ -840,6 +860,16 @@ struct urma_socket_shared_state_t
   std::chrono::microseconds idle_poll_interval_{5};
   bool poll_spin_ = true;
   static constexpr std::size_t max_active_poll_budget_ = 64;
+  // Consecutive empty inline batches before a spin-mode socket yields to the
+  // timer cadence (start_polling). Hysteresis: large enough that bursty load
+  // keeps the loop busy-spinning (no latency regression), small enough that
+  // sustained idle frees the core within ~threshold*inline_rounds polls.
+  // Configurable via MC_YLT_URMA_IDLE_YIELD_THRESHOLD (default 64); 0 disables
+  // the yield entirely (pure busy-spin).
+  std::size_t idle_yield_threshold_ = 64;
+  // Consecutive empty inline batches seen so far in spin mode (reset on any
+  // non-empty batch).
+  std::size_t idle_yield_count_ = 0;
   // Poll rounds executed inline before yielding to the io_context in spin mode.
   static constexpr std::size_t kPollInlineBatch = 8;
   // Upper bound on consecutive non-empty drain rounds per jfce event.
@@ -889,8 +919,15 @@ class urma_socket_t {
     // timer tick costs two timerfd_settime plus an epoll wake-up. This removes
     // the per-socket timerfd storm and cuts completion latency to one poll
     // round, at the cost of one busy core per reactor thread that owns a
-    // timer-mode socket. Set MC_YLT_URMA_POLL_SPIN=0 to restore the timer cadence.
+    // timer-mode socket. Set MC_YLT_URMA_POLL_SPIN=0 to restore the timer
+    // cadence.
     bool poll_spin = true;
+    // Timer-mode spin only: consecutive empty inline batches before a spin-mode
+    // socket yields to the timer cadence (start_polling). Larger values keep
+    // the loop busy-spinning longer under low/bursty load (lower tail latency,
+    // more CPU). 0 disables the yield entirely (pure busy-spin, never arms the
+    // timer). Tunable via MC_YLT_URMA_IDLE_YIELD_THRESHOLD (default 64).
+    std::size_t idle_yield_threshold = 64;
   };
 
   enum io_type { recv = 0, send = 1 };
@@ -1201,6 +1238,7 @@ class urma_socket_t {
     state_->jfc_moderate_period_ = conf_.jfc_moderate_period;
     state_->idle_poll_interval_ = conf_.poll_interval;
     state_->poll_spin_ = conf_.poll_spin;
+    state_->idle_yield_threshold_ = conf_.idle_yield_threshold;
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode,
                       conf_.jfs_priority, conf_.tp_type)) {
       auto stage = state_->init_stage_;

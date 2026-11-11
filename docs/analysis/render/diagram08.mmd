@@ -1,0 +1,15 @@
+flowchart TD
+    A["async_simple 调度请求"] --> B{"调用哪个入口？"}
+    B -->|"schedule(Func)<br/>io_context_pool.hpp:101"| C["asio::post(executor_, f)<br/>io_context_pool.hpp:102"]
+    B -->|"schedule(Func, hint)<br/>io_context_pool.hpp:106"| D{"hint >= YIELD(0x8) ?<br/>io_context_pool.hpp:107-108"}
+    D -->|"是（YIELD/LOWEST：让出）"| C2["asio::post<br/>io_context_pool.hpp:109"]
+    D -->|"否（HIGHEST/DEFAULT）"| E["asio::dispatch<br/>io_context_pool.hpp:112"]
+    E --> F{"running_in_this_thread() ?<br/>= scheduler::can_dispatch()"}
+    F -->|"是"| G["内联执行<br/>impl/io_context.hpp:206-217"]
+    F -->|"否"| H["post_immediate_completion<br/>impl/io_context.hpp:239-240"]
+    C --> I[("scheduler::op_queue_<br/>或 private_op_queue")]
+    C2 --> I
+    H --> I
+    I --> J["do_run_one 取出并 complete<br/>scheduler.ipp:461-500"]
+    J --> K["func() 在 io_context 线程执行"]
+    G --> K

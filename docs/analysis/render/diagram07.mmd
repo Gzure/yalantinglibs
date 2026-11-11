@@ -1,0 +1,32 @@
+sequenceDiagram
+    autonumber
+    participant IO as 业务协程（发起 async_read）
+    participant RS as reactor socket service
+    participant R as epoll_reactor
+    participant DQ as descriptor_state::op_queue_
+    participant S as scheduler
+    participant RUN as run() 线程
+
+    IO->>RS: async_read(socket, buf, handler)
+    RS->>R: start_op(read_op, ...)
+    R->>R: 先投机执行 op->perform()（直接 syscall）
+    alt 投机成功（数据已就绪）
+        R->>R: on_immediate(op) → scheduler_.post_immediate_completion
+    else 未就绪
+        R->>DQ: op_queue_[read_op].push(op)
+        R->>S: scheduler_.work_started()
+        Note over R,S: 此时 op 不在 scheduler 队列里，只占 work 计数
+        S->>RUN: run 循环下一次轮到 task_operation_
+        RUN->>R: task_->run(block, 私有队列) → epoll_wait
+        R-->>RUN: fd 可读事件
+        R->>S: 私有队列 push(descriptor_state), task_result_=事件掩码
+        RUN->>S: task_cleanup 把私有队列并入 op_queue_
+        RUN->>S: do_run_one 弹出 descriptor_state
+        S->>S: o->complete(owner, ec, task_result) → descriptor_state::do_complete
+        S->>R: perform_io(events)
+        R->>DQ: 对就绪 op 调 perform()，已完成的弹出
+        R-->>S: 返回 first_op
+        S->>IO: op->complete(owner, ...) 调用 handler（第一个 op 直接调用）
+        R->>S: 其余已完成 op：post_deferred_completions
+        S->>RUN: 后续轮次逐个 complete
+    end

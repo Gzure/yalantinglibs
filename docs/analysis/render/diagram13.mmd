@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    participant CA as 调用方协程 A
+    participant CB as post() 生成的协程 B
+    participant AW as callback_awaitor / post_helper
+    participant EX as asio executor
+    participant SCH as scheduler 队列
+    participant RUN as io_context::run 线程
+
+    CA->>CB: co_await coro_io::post(func, e)
+    CB->>AW: co_await awaitor.await_resume(helper)
+    AW->>AW: await_suspend 保存 handle，调用 op(handler)<br/>coro_io.hpp:79-82
+    AW->>EX: asio::post(e, lambda)<br/>coro_io.hpp:169
+    EX->>SCH: post_immediate_completion<br/>impl/io_context.hpp:239-241
+    alt 同一 io_context 线程（one_thread_ 快路径）
+        SCH->>SCH: private_op_queue.push<br/>scheduler.ipp:356-363
+    else 其他线程
+        SCH->>SCH: work_started + op_queue_.push + wake_one_thread<br/>scheduler.ipp:369-372
+    end
+    RUN->>SCH: do_run_one 取队首
+    SCH-->>RUN: o->complete → 执行 posted lambda
+    RUN->>AW: func() 然后 handler.resume()<br/>coro_io.hpp:172-177
+    AW->>CB: coro_.resume()<br/>coro_io.hpp:137
+    CB-->>CA: co_return / final_suspend 恢复 _continuation<br/>Lazy.h:99-108
+    Note over CA: 协程 A 在该 io_context 线程上继续执行

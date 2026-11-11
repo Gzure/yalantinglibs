@@ -1,0 +1,15 @@
+flowchart LR
+    P["asio::post(ex,f)<br/>post.hpp:161"] --> IP["initiate_post_with_executor<br/>detail/initiate_post.hpp:111"]
+    IP -->|"require(ex, blocking.never)<br/>+ prefer(fork, allocator)"| EX1["execute(f)"]
+    D["asio::dispatch(ex,f)<br/>dispatch.hpp:143"] --> ID["initiate_dispatch_with_executor<br/>detail/initiate_dispatch.hpp:105"]
+    ID -->|"prefer(allocator)<br/>不加 blocking.never"| EX1
+    F["asio::defer(ex,f)<br/>defer.hpp:175"] --> IF["initiate_defer_with_executor<br/>detail/initiate_defer.hpp:111"]
+    IF -->|"require(blocking.never)<br/>+ relationship.continuation"| EX1
+    EX1 --> X{"basic_executor_type::execute<br/>impl/io_context.hpp:199"}
+    X -->|"blocking_possibly 且 can_dispatch"| RUNNOW["fenced_block 内立即执行<br/>impl/io_context.hpp:206-226"]
+    X -->|"否则"| OP["new executor_op 包装 f<br/>detail/executor_op.hpp:30-77"]
+    OP --> PIC["post_immediate_completion(op, is_continuation)<br/>impl/io_context.hpp:239-240"]
+    PIC --> SCH["scheduler::post_immediate_completion<br/>scheduler.ipp:352-373"]
+    SCH --> PQ{"(one_thread_ 或 is_continuation)<br/>且当前线程在本 scheduler 内?"}
+    PQ -->|"是"| PRIV[("private_op_queue<br/>免锁暂存")]
+    PQ -->|"否"| GLOB[("op_queue_ + wake_one_thread<br/>scheduler.ipp:369-372")]

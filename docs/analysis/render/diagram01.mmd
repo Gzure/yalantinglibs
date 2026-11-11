@@ -1,0 +1,44 @@
+flowchart TB
+    subgraph APP["应用层"]
+        A1["coro_rpc_server / coro_rpc_client"]
+        A2["client_pool / coro_file / channel / cuda_stream"]
+        A3["业务协程 async_simple::coro::Lazy"]
+    end
+    subgraph YLT["coro_io 适配层 include/ylt/coro_io"]
+        W["ExecutorWrapper&lt;ExecutorImpl&gt;<br/>async_simple::Executor 的实现<br/>io_context_pool.hpp:55"]
+        P["io_context_pool<br/>N × io_context + work_guard<br/>io_context_pool.hpp:190"]
+        P2["multithread_context_pool<br/>1 × io_context + N 线程<br/>io_context_pool.hpp:359"]
+        H["coro_io::post / dispatch / sleep_for<br/>coro_io.hpp:214-255,651"]
+    end
+    subgraph ASIO["asio 1.36 include/ylt/thirdparty/asio"]
+        I["asio::io_context<br/>execution_context 壳<br/>io_context.hpp:191"]
+        E["basic_executor_type<br/>uintptr_t 句柄<br/>io_context.hpp:202-208"]
+        S["detail::scheduler 服务<br/>io_context.hpp:53"]
+        Q[("op_queue_ 全局就绪队列<br/>侵入式单链表<br/>scheduler.hpp:222")]
+        PQ[("private_op_queue<br/>线程私有暂存<br/>scheduler_thread_info.hpp")]
+        T["scheduler_task<br/>= epoll_reactor"]
+        WK["outstanding_work_<br/>atomic_count<br/>scheduler.hpp:219"]
+        DQ[("descriptor_state::op_queue_[3]<br/>每个 fd 的读写等操作")]
+    end
+    subgraph OS["内核"]
+        EPOLL["epoll_wait + eventfd 唤醒"]
+        TIMER["timerfd / 定时器堆"]
+    end
+
+    A1 --> P
+    A2 --> P
+    A3 --> H
+    H --> E
+    W --> E
+    P -->|"持有 N 个"| I
+    P2 --> I
+    I -->|"impl_ 就是"| S
+    E -->|"execute/dispatch/post/defer"| S
+    S --> Q
+    S --> PQ
+    S --> WK
+    S --> T
+    T --> DQ
+    T --> EPOLL
+    T --> TIMER
+    Q -->|"do_run_one 取出 complete"| T

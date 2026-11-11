@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    participant RUN as run() 线程
+    participant S as scheduler
+    participant TC as task_cleanup
+    participant R as epoll_reactor
+    participant K as 内核 epoll
+    participant DQ as descriptor_state 队列
+
+    RUN->>S: do_run_one 弹出 task_operation_
+    S->>S: task_interrupted_ = more || task_usec_==0
+    S->>R: task_->run(block_ms, private_op_queue)
+    R->>K: epoll_wait(fd, events, 128, timeout)
+    K-->>R: 就绪事件数组
+    loop 每个事件
+        alt interrupter 事件
+            R->>R: 仅置 check_timers = true，不做唤醒重置
+        else timerfd 事件
+            R->>R: check_timers = true
+        else fd 就绪
+            R->>DQ: set_ready_events(events)
+            R->>R: ops.push(descriptor_state)（若尚未入队）
+        end
+    end
+    R->>R: 到期定时器也 push 进 ops
+    R-->>S: run 返回，ops = private_op_queue
+    S->>TC: task_cleanup 析构
+    TC->>S: 加锁，private_op_queue 整链 push 进 op_queue_
+    TC->>S: task_operation_ 重新 push 到队尾
+    S-->>RUN: 下一轮循环继续

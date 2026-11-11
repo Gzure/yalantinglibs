@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    participant Srv as coro_rpc_server_base
+    participant Acc as tcp_server_acceptor
+    participant Pool as io_context_pool
+    participant EW as ExecutorWrapper
+    participant Conn as coro_connection
+    participant Cli as coro_rpc_client
+    participant CP as client_pool
+
+    Srv->>Pool: 构造 pool_(thread_num)<br/>coro_rpc_server.hpp:138
+    Srv->>Acc: set_io_threads_pool(&pool_)<br/>coro_rpc_server.hpp:315
+    Srv->>Pool: std::thread{ pool_.run() }<br/>coro_rpc_server.hpp:341-343
+    Acc->>Pool: listen() → get_executor()<br/>server_acceptor.hpp:65
+    Pool->>Pool: fetch_add(1, relaxed)
+    Pool-->>Acc: executors[i % N]
+    Note over Acc,EW: acceptor 从此固定在该 io_context 上
+    loop accept 循环
+        Acc->>Pool: get_executor()（每个新连接一次）<br/>server_acceptor.hpp:116
+        Pool-->>Acc: 下一个 executor（round-robin）
+        Acc->>Acc: co_await dispatch(acceptor executor)<br/>server_acceptor.hpp:119
+        Acc->>Acc: async_accept<br/>server_acceptor.hpp:120
+        Acc-->>Srv: socket_wrapper_t{socket, socket_executor}<br/>server_acceptor.hpp:142
+        Srv->>Conn: start_one(conn).directlyStart(cb, executor)<br/>coro_rpc_server.hpp:677-682
+        Note over Conn: 连接所有 I/O 钉在该 executor 上<br/>coro_connection.hpp:168-173,557
+    end
+    Cli->>Pool: get_global_executor()<br/>coro_rpc_client.hpp:303
+    Pool-->>Cli: g_io_context_pool().get_executor()
+    CP->>Pool: io_context_pool_.get_executor()<br/>client_pool.hpp:312
+    Pool-->>CP: executors[i % N]

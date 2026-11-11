@@ -1,0 +1,30 @@
+flowchart TB
+    subgraph POOL["io_context_pool（pool_size = N）"]
+        RR["next_io_context_<br/>atomic fetch_add(1, relaxed)<br/>io_context_pool.hpp:303"]
+        IOC0["asio::io_context(1) #0<br/>io_context_pool.hpp:202"]
+        IOCN["asio::io_context(1) #N-1"]
+        WG0["executor_work_guard #0<br/>work_ 数组<br/>:203,208"]
+        WGN["executor_work_guard #N-1"]
+        EW0["ExecutorWrapper #0<br/>:205-207"]
+        EWN["ExecutorWrapper #N-1"]
+        TH0["std::thread #0<br/>get_current(); ioc->run()<br/>:226-233"]
+        THN["std::thread #N-1"]
+        RR -->|"i % N"| EW0
+        RR -->|"i % N"| EWN
+        IOC0 -->|"get_executor()"| EW0
+        IOCN -->|"get_executor()"| EWN
+        WG0 -.->|"on_work_started 保活"| IOC0
+        WGN -.->|"on_work_started 保活"| IOCN
+        TH0 -->|"run()"| IOC0
+        THN -->|"run()"| IOCN
+    end
+
+    subgraph ASIO["每个 io_context 内部"]
+        SCH[("scheduler::op_queue_<br/>scheduler.hpp:222")]
+        REACT["reactor：epoll / 定时器"]
+    end
+
+    EW0 -->|"schedule() → asio::post / dispatch"| SCH
+    EWN -->|"schedule()"| SCH
+    REACT -->|"到期/完成 → post_deferred_completion"| SCH
+    SCH -->|"do_run_one"| TH0

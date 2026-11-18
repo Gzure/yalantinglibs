@@ -77,6 +77,10 @@ struct options_t {
   // One JFC per io_context instead of one per connection. Only exists in poll
   // mode, so it also selects --event-mode false unless that was given.
   bool shared_jfc = true;
+  // Shared JFC only: microseconds without a completion before the poll loop
+  // sleeps on the JFC's completion event (URMA_RPC_SHARED_JFC_IDLE_US).
+  // 0 = always spin; -1 = keep the library default (1000).
+  int64_t shared_jfc_idle_us = -1;
   uint32_t payload_size = 64;
   uint32_t latency_iters = 10000;
   uint32_t warmup_iters = 1000;
@@ -125,6 +129,10 @@ void configure_urma_rpc_env(const options_t& opt) {
   set_process_env("URMA_RPC_PRIORITY", std::to_string(opt.priority));
   set_process_env("URMA_RPC_EVENT_MODE", opt.event_mode);
   set_process_env("URMA_RPC_SHARED_JFC", opt.shared_jfc ? "1" : "0");
+  if (opt.shared_jfc_idle_us >= 0) {
+    set_process_env("URMA_RPC_SHARED_JFC_IDLE_US",
+                    std::to_string(opt.shared_jfc_idle_us));
+  }
 }
 
 void print_usage(const char* program) {
@@ -152,6 +160,9 @@ void print_usage(const char* program) {
          "false with --shared-jfc true\n"
       << "  --shared-jfc <true|false> One JFC per io_context (poll mode "
          "only; sets URMA_RPC_SHARED_JFC). Default true\n"
+      << "  --shared-jfc-idle-us <n> Idle time before the shared poll loop "
+         "sleeps; 0 = always spin (sets URMA_RPC_SHARED_JFC_IDLE_US). "
+         "Default 1000\n"
       << "  --profile                Enable in-memory stage latency profiling. "
          "Default off\n"
       << "  --profile-sample-rate <n> Record one sample every n events per "
@@ -281,6 +292,12 @@ options_t parse_options(int argc, char** argv) {
             "--shared-jfc must be true or false, got: " + std::string(value));
       }
       opt.shared_jfc = value == "true";
+    }
+    else if (key == "--shared-jfc-idle-us") {
+      auto idle = parse_u64(require_value(), key);
+      if (idle > 1000000)
+        throw std::invalid_argument("--shared-jfc-idle-us must be <= 1000000");
+      opt.shared_jfc_idle_us = static_cast<int64_t>(idle);
     }
     else if (key == "--event-mode") {
       opt.event_mode_set = true;
@@ -424,7 +441,10 @@ coro_io::urma_socket_t::config_t make_urma_config(const options_t& opt) {
       .tp_type = URMA_CTP,
       .jfs_priority = opt.priority,
       .event_mode = opt.event_mode == "true",
-      .shared_jfc = opt.shared_jfc};
+      .shared_jfc = opt.shared_jfc,
+      .shared_jfc_idle_us = opt.shared_jfc_idle_us >= 0
+                                ? static_cast<uint32_t>(opt.shared_jfc_idle_us)
+                                : 1000u};
 }
 
 bool init_global_urma(const options_t& opt) {

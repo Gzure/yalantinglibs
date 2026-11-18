@@ -129,6 +129,10 @@ Throughput only:
                          connections (URMA_RPC_SHARED_JFC). Default true.
                          Poll mode only: it selects --event-mode false
                          unless --event-mode is given
+--shared-jfc-idle-us <n> Microseconds without a completion before the shared
+                         poll loop sleeps on the completion event
+                         (URMA_RPC_SHARED_JFC_IDLE_US). 0 = always spin.
+                         Default 1000
 --event-mode <true|false> URMA event-driven completion. Default true, or
                          false when --shared-jfc is true
 --profile                Enable in-memory stage latency profiling. Default off.

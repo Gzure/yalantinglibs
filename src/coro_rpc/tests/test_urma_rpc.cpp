@@ -646,6 +646,28 @@ TEST_CASE("urma jfc group registry keeps a draining socket pinned") {
   CHECK_FALSE(registry.has_live_socket());
 }
 
+TEST_CASE("urma jfc group registry reports whether a socket still fits") {
+  using coro_io::detail::jfc_group_registry;
+
+  jfc_group_registry registry(/*max_wr=*/128);
+  CHECK(registry.has_room(128));
+  CHECK_FALSE(registry.has_room(129));  // larger than the whole CQ
+  auto a = std::make_shared<mock_group_socket>();
+  const int sid = registry.attach(a, 100);
+  REQUIRE(sid >= 0);
+  CHECK(registry.has_room(28));
+  CHECK_FALSE(registry.has_room(29));  // the group spills to a new one then
+  {
+    auto dead = std::make_shared<mock_group_socket>();
+    REQUIRE(registry.attach(dead, 28) >= 0);
+    CHECK_FALSE(registry.has_room(1));
+  }  // died without detaching: has_room() prunes it like attach() does
+  CHECK(registry.has_room(28));
+  CHECK(registry.detach(sid));
+  CHECK(registry.has_room(128));
+  CHECK(jfc_group_registry(/*max_wr=*/0).has_room(1u << 30));  // unbounded
+}
+
 TEST_CASE("urma jfc group registry resolves a completion batch at once") {
   using coro_io::detail::jfc_group_registry;
   using coro_io::detail::jfc_group_socket;

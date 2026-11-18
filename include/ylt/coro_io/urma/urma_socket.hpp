@@ -253,21 +253,27 @@ struct urma_socket_shared_state_t
       shared_jfc_ = false;
     }
     if (shared_jfc_) {
-      group_ = urma_jfc_group::get(executor_, device_->context(),
-                                   group_cq_size_, cap.max_jfc_depth, io_rate_,
-                                   device_->async_events());
+      const auto wr_reserve =
+          static_cast<uint32_t>(recv_buffer_cnt_ + send_buffer_cnt + 4);
       int sid = -1;
-      if (group_ && group_->valid()) {
-        sid = group_->attach(
-            shared_from_this(),
-            static_cast<uint32_t>(recv_buffer_cnt_ + send_buffer_cnt + 4));
+      // get() returns a group with room or adds one; a concurrent attach can
+      // still fill it first (-2), and the second get() then adds a group.
+      for (int attempt = 0; attempt < 2 && sid < 0; ++attempt) {
+        group_ = urma_jfc_group::get(
+            executor_, device_->context(), group_cq_size_, cap.max_jfc_depth,
+            io_rate_, wr_reserve, device_->async_events());
+        if (!group_ || !group_->valid())
+          break;
+        sid = group_->attach(shared_from_this(), wr_reserve);
+        if (sid != -2)
+          break;
       }
       if (sid < 0) {
         ELOG_WARN << "URMA shared JFC unavailable (sid=" << sid
-                  << "): group failed/full or CQ depth too small (depth="
-                  << (group_ ? group_->cq_size() : 0) << ", requested="
-                  << static_cast<unsigned>(recv_buffer_cnt_ + send_buffer_cnt +
-                                           4)
+                  << "): JFC creation failed, group failed, or CQ depth too "
+                     "small (depth="
+                  << (group_ ? group_->cq_size() : 0)
+                  << ", requested=" << wr_reserve
                   << "); using a per-socket JFC";
         group_.reset();
         shared_jfc_ = false;
@@ -281,6 +287,12 @@ struct urma_socket_shared_state_t
       event_mode_enabled_ = false;
       send_slots_ =
           std::make_unique<seq_slot_ring<pending_send>>(send_buffer_cnt + 2);
+      if (group_->io_rate() != io_rate_) {
+        ELOG_WARN << "URMA shared JFC: group polls " << group_->io_rate()
+                  << " rounds per tick (set by its first socket); this "
+                     "socket's io_rate rounds="
+                  << io_rate_ << " is ignored";
+      }
       ELOG_INFO << "URMA using shared JFC: sid=" << group_sid_.load()
                 << ", jfc_depth=" << group_->cq_size()
                 << ", sockets=" << group_->socket_count();

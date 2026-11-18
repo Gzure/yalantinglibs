@@ -340,6 +340,15 @@ class jfc_group_registry {
     return used_wr_;
   }
 
+  // True when attach(wr_reserve) would fit into the CQ depth (after dropping
+  // sockets that died without detaching). A concurrent attach can still take
+  // the room first; attach() stays authoritative and returns -2 then.
+  bool has_room(uint32_t wr_reserve) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prune_expired_locked();
+    return max_wr_ == 0 || used_wr_ + wr_reserve <= max_wr_;
+  }
+
   void for_each(const std::function<void(jfc_group_socket&)>& fn) {
     std::vector<std::shared_ptr<jfc_group_socket>> sockets;
     {

@@ -82,6 +82,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   static std::shared_ptr<urma_jfc_group> get(
       coro_io::ExecutorWrapper<>* executor, urma_context_t* context,
       uint32_t cq_size, uint32_t max_cq_depth, uint32_t io_rate,
+      uint32_t wr_reserve = 0,
       std::shared_ptr<urma_async_event_hub> async_events = nullptr) {
     if (!executor || !context)
       return nullptr;
@@ -90,39 +91,43 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
         std::make_pair(static_cast<void*>(&asio_executor.context()),
                        static_cast<void*>(context));
     {
-      // Fast path: an existing live group, without creating anything.
+      // Fast path: an existing live group with room, without creating one.
       std::lock_guard<std::mutex> lock(registry_mutex());
-      auto& groups = registry();
-      prune_expired_locked(groups);
-      auto it = groups.find(key);
-      if (it != groups.end()) {
-        if (auto existing = it->second.lock()) {
-          if (!existing->failed_.load(std::memory_order_relaxed))
-            return existing;
-          it->second.reset();  // failed groups must not be reused
-        }
-      }
+      if (auto existing = find_with_room_locked(key, wr_reserve))
+        return existing;
     }
 
-    // Create the JFC outside the process-wide lock: urma_create_jfc is a driver
-    // call and used to serialize group creation for every io_context.
+    // Every group of this io_context is full (or there is none yet): add one
+    // instead of falling back to a per-socket JFC, whose spin loop would then
+    // compete with the group's on the same reactor thread. The JFC is created
+    // outside the process-wide lock: urma_create_jfc is a driver call and used
+    // to serialize group creation for every io_context.
     auto group = std::shared_ptr<urma_jfc_group>(
         new urma_jfc_group(std::move(asio_executor), io_rate));
     if (!group->init(context, cq_size, max_cq_depth))
       return nullptr;
+    if (!group->has_room(wr_reserve)) {
+      // Even an empty group cannot hold this socket: adding more groups would
+      // not help.
+      ELOG_WARN << "URMA shared JFC: one socket needs " << wr_reserve
+                << " CQ entries but the group depth is " << group->cq_size();
+      return nullptr;
+    }
 
+    std::size_t group_count = 0;
     {
       std::lock_guard<std::mutex> lock(registry_mutex());
-      auto& groups = registry();
-      prune_expired_locked(groups);
-      auto it = groups.find(key);
-      if (it != groups.end()) {
-        if (auto existing = it->second.lock()) {
-          if (!existing->failed_.load(std::memory_order_relaxed))
-            return existing;  // another thread won: drop our extra JFC
-        }
-      }
-      groups[key] = group;
+      // Another thread may have added a group with room meanwhile: use it and
+      // drop our extra JFC.
+      if (auto existing = find_with_room_locked(key, wr_reserve))
+        return existing;
+      auto& groups = registry()[key];
+      groups.push_back(group);
+      group_count = groups.size();
+    }
+    if (group_count > 1) {
+      ELOG_INFO << "URMA shared JFC: io_context now has " << group_count
+                << " groups (each full group spills into a new JFC)";
     }
     group->subscribe_async_events(std::move(async_events));
     return group;
@@ -202,6 +207,10 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return failed_.load(std::memory_order_relaxed);
   }
   std::size_t socket_count() const { return registry_.size(); }
+  uint32_t io_rate() const noexcept { return io_rate_; }
+  bool has_room(uint32_t wr_reserve) {
+    return !failed() && registry_.has_room(wr_reserve);
+  }
 
  private:
   using key_type = std::pair<void*, void*>;
@@ -263,7 +272,13 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     }
     std::array<urma_cr_t, kPollBatch> completions{};
     std::array<std::shared_ptr<jfc_group_socket>, kPollBatch> owners{};
-    for (std::size_t round = 0; round < io_rate_; ++round) {
+    std::size_t delivered = 0;
+    // io_rate_ bounds the poll rounds; kMaxCompletionsPerTick bounds the
+    // dispatched callbacks, so a busy CQ cannot hold the reactor thread for
+    // io_rate_ * kPollBatch callbacks (12672 at io_rate=99%). The rest stays
+    // queued for the next tick, after the io_context ran its other handlers.
+    for (std::size_t round = 0;
+         round < io_rate_ && delivered < kMaxCompletionsPerTick; ++round) {
       if (!alive_.load(std::memory_order_relaxed) ||
           failed_.load(std::memory_order_relaxed)) {
         polling_.store(false, std::memory_order_relaxed);
@@ -282,6 +297,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
       const std::size_t resolved =
           registry_.resolve(completions.data(), batch, owners.data());
       stale_completions_ += batch - resolved;
+      delivered += resolved;
       for (std::size_t i = 0; i < batch; ++i) {
         auto owner = std::move(owners[i]);
         if (!owner)
@@ -363,14 +379,31 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     });
   }
 
-  static void prune_expired_locked(
-      std::map<key_type, std::weak_ptr<urma_jfc_group>>& groups) {
-    for (auto it = groups.begin(); it != groups.end();) {
-      if (it->second.expired())
-        it = groups.erase(it);
-      else
-        ++it;
+  using group_list = std::vector<std::weak_ptr<urma_jfc_group>>;
+
+  // Caller holds registry_mutex(). Drops dead and failed groups of `key` (a
+  // failed group must not be reused) and returns the first one with room.
+  static std::shared_ptr<urma_jfc_group> find_with_room_locked(
+      const key_type& key, uint32_t wr_reserve) {
+    auto& groups = registry();
+    auto it = groups.find(key);
+    if (it == groups.end())
+      return nullptr;
+    auto& list = it->second;
+    std::shared_ptr<urma_jfc_group> found;
+    for (auto entry = list.begin(); entry != list.end();) {
+      auto group = entry->lock();
+      if (!group || group->failed()) {
+        entry = list.erase(entry);
+        continue;
+      }
+      if (!found && group->has_room(wr_reserve))
+        found = std::move(group);
+      ++entry;
     }
+    if (list.empty())
+      groups.erase(it);
+    return found;
   }
 
   static std::mutex& registry_mutex() {
@@ -378,14 +411,15 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return *value;
   }
 
-  static std::map<key_type, std::weak_ptr<urma_jfc_group>>& registry() {
-    static auto* value =
-        new std::map<key_type, std::weak_ptr<urma_jfc_group>>();
+  static std::map<key_type, group_list>& registry() {
+    static auto* value = new std::map<key_type, group_list>();
     return *value;
   }
 
   // Completions drained per urma_poll_jfc call.
   static constexpr std::size_t kPollBatch = 16;
+  // Completions dispatched per tick before yielding to the io_context.
+  static constexpr std::size_t kMaxCompletionsPerTick = 256;
 
   asio::any_io_executor executor_;
   std::shared_ptr<urma_async_event_hub> async_events_;

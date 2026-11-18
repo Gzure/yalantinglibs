@@ -32,6 +32,7 @@
 #include <mutex>
 #include <optional>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -77,6 +78,17 @@ inline decoded_ctx decode_ctx(uint64_t value) noexcept {
 
 inline bool is_valid_ctx_op(urma_ctx_op op) noexcept {
   return op == urma_ctx_op::send || op == urma_ctx_op::recv;
+}
+
+// URMA_CR_WR_SUSPEND_DONE and URMA_CR_WR_FLUSH_ERR_DONE are records the
+// hardware constructs to report a jetty/jfs state change. The UMDK headers
+// document their user_ctx as invalid, so they must never be routed by user_ctx
+// (garbage may decode to a live sid) nor matched against a pending WR (they do
+// not complete one). Real per-WR error records such as URMA_CR_WR_FLUSH_ERR
+// keep a valid user_ctx and are delivered normally.
+inline bool is_hw_constructed_cr(const urma_cr_t& cr) noexcept {
+  return cr.status == URMA_CR_WR_SUSPEND_DONE ||
+         cr.status == URMA_CR_WR_FLUSH_ERR_DONE;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,35 +240,60 @@ class jfc_group_registry {
     return true;
   }
 
-  // Dispatches one completion record. Returns false for an unknown / expired
-  // sid (a completion of a socket that already closed), an unknown op, or a
-  // completion whose user_ctx was not filled in by the driver.
-  bool dispatch(const urma_cr_t& cr) {
-    if (cr.user_ctx == 0)
-      return false;
-    const auto ctx = decode_ctx(cr.user_ctx);
-    if (!is_valid_ctx_op(ctx.op))
-      return false;
-    // The user_ctx and the completion direction must agree; if they do not, the
-    // driver did not round-trip user_ctx correctly and dispatching would settle
-    // the wrong pending work.
-    if ((cr.flag.bs.s_r != 0) != (ctx.op == urma_ctx_op::recv))
-      return false;
-    std::shared_ptr<jfc_group_socket> socket;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto it = slots_.find(ctx.sid);
+  // Resolves the owning socket of every record in one batch, taking the lock
+  // once per batch instead of once per completion. out[i] is left null for a
+  // record that must be dropped: a hardware-constructed record, an unknown /
+  // expired sid (a completion of a socket that already closed), an unknown op,
+  // or a user_ctx the driver did not fill in. Returns the number of records
+  // that resolved to a live socket.
+  //
+  // The strong pointers keep the sockets alive while the caller delivers the
+  // batch outside the lock. A delivery may close (and detach) another socket of
+  // the same batch; sockets therefore ignore completions after close().
+  std::size_t resolve(const urma_cr_t* crs, std::size_t count,
+                      std::shared_ptr<jfc_group_socket>* out) {
+    std::size_t resolved = 0;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (std::size_t i = 0; i < count; ++i) {
+      out[i].reset();
+      uint32_t sid = 0;
+      if (!routable(crs[i], sid))
+        continue;
+      auto it = slots_.find(sid);
       if (it == slots_.end())
-        return false;
-      socket = it->second.weak.lock();
+        continue;
+      out[i] = it->second.weak.lock();
+      if (out[i])
+        ++resolved;
     }
-    if (!socket)
-      return false;
-    if (ctx.op == urma_ctx_op::send)
-      socket->on_send_completion(cr);
+    return resolved;
+  }
+
+  // Delivers a record that resolve() routed to `socket`.
+  static void deliver(jfc_group_socket& socket, const urma_cr_t& cr) {
+    if (cr.flag.bs.s_r == 0)
+      socket.on_send_completion(cr);
     else
-      socket->on_recv_completion(cr);
+      socket.on_recv_completion(cr);
+  }
+
+  // Dispatches one completion record; see resolve() for when it is dropped.
+  bool dispatch(const urma_cr_t& cr) {
+    std::shared_ptr<jfc_group_socket> socket;
+    if (resolve(&cr, 1, &socket) == 0)
+      return false;
+    deliver(*socket, cr);
     return true;
+  }
+
+  // True while at least one attached socket is alive. Stops at the first live
+  // entry, so the poll loop's per-tick idle check is O(1) in the common case.
+  bool has_live_socket() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [sid, entry] : slots_)
+      if (!entry.weak.expired())
+        return true;
+    return false;
   }
 
   std::size_t size() const {
@@ -305,6 +342,23 @@ class jfc_group_registry {
     uint32_t reserve = 0;
   };
 
+  // Validates a record and extracts its sid. Rejects hardware-constructed
+  // records first: their user_ctx is invalid and must not be decoded.
+  static bool routable(const urma_cr_t& cr, uint32_t& sid) noexcept {
+    if (is_hw_constructed_cr(cr) || cr.user_ctx == 0)
+      return false;
+    const auto ctx = decode_ctx(cr.user_ctx);
+    if (!is_valid_ctx_op(ctx.op))
+      return false;
+    // The user_ctx and the completion direction must agree; if they do not, the
+    // driver did not round-trip user_ctx correctly and dispatching would settle
+    // the wrong pending work.
+    if ((cr.flag.bs.s_r != 0) != (ctx.op == urma_ctx_op::recv))
+      return false;
+    sid = ctx.sid;
+    return true;
+  }
+
   // Drops entries whose socket died without detaching, so their CQ reservation
   // cannot block every future attach.
   void prune_expired_locked() {
@@ -321,7 +375,7 @@ class jfc_group_registry {
   }
 
   mutable std::mutex mutex_;
-  std::map<uint32_t, slot> slots_;
+  std::unordered_map<uint32_t, slot> slots_;
   uint32_t next_sid_ = 0;
   std::size_t used_wr_ = 0;
   std::size_t max_wr_ = 0;
@@ -415,12 +469,14 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   // buffers + slack). Returns sid, or < 0 on failure (group full / CQ too
   // small / group already failed).
   //
-  // Everything happens under registry_mutex() so a concurrent fail_all() either
+  // Everything happens under state_mutex_ so a concurrent fail_all() either
   // runs before this attach (which then returns -3) or after it (and its
   // for_each covers the new socket). There is no window that yields a socket
-  // with a sid but no poll loop.
+  // with a sid but no poll loop. state_mutex_ is per group: the process-wide
+  // registry_mutex() only guards the group lookup table in get(), so reactor
+  // threads of different io_contexts never contend on the poll path.
   int attach(std::shared_ptr<jfc_group_socket> socket, uint32_t wr_reserve) {
-    std::lock_guard<std::mutex> lock(registry_mutex());
+    std::lock_guard<std::mutex> lock(state_mutex_);
     if (failed_.load(std::memory_order_relaxed))
       return -3;
     const int sid = registry_.attach(std::move(socket), wr_reserve);
@@ -505,7 +561,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     });
   }
 
-  // Caller holds registry_mutex().
+  // Caller holds state_mutex_.
   void schedule_locked() {
     if (!alive_.load(std::memory_order_relaxed))
       return;
@@ -523,7 +579,8 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
       polling_.store(false, std::memory_order_relaxed);
       return;
     }
-    std::array<urma_cr_t, 16> completions{};
+    std::array<urma_cr_t, kPollBatch> completions{};
+    std::array<std::shared_ptr<jfc_group_socket>, kPollBatch> owners{};
     for (std::size_t round = 0; round < io_rate_; ++round) {
       if (!alive_.load(std::memory_order_relaxed) ||
           failed_.load(std::memory_order_relaxed)) {
@@ -536,21 +593,18 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
         fail_all(std::make_error_code(std::errc::io_error));
         return;
       }
-      for (int i = 0; i < count; ++i) {
-        // A socket callback resumes application coroutines. A throwing callback
-        // must not kill the group's poll loop (which would silently stop every
-        // socket on this io_context), so catch per completion and keep
-        // draining.
-        try {
-          if (!registry_.dispatch(completions[i]))
-            ++stale_completions_;
-        } catch (const std::exception& e) {
-          ++dispatch_failures_;
-          ELOG_ERROR << "URMA shared JFC dispatch threw: " << e.what();
-        } catch (...) {
-          ++dispatch_failures_;
-          ELOG_ERROR << "URMA shared JFC dispatch threw an unknown exception";
-        }
+      if (count == 0)
+        continue;
+      const auto batch = static_cast<std::size_t>(count);
+      // One registry lock per batch instead of one per completion.
+      const std::size_t resolved =
+          registry_.resolve(completions.data(), batch, owners.data());
+      stale_completions_ += batch - resolved;
+      for (std::size_t i = 0; i < batch; ++i) {
+        auto owner = std::move(owners[i]);
+        if (!owner)
+          continue;
+        deliver_guarded(*owner, completions[i]);
       }
     }
     // No attached socket: let the group be destroyed instead of keeping itself
@@ -559,11 +613,12 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     // died without detaching); a separate counter used to diverge from it and
     // keep the loop spinning forever.
     {
-      std::lock_guard<std::mutex> lock(registry_mutex());
-      if (registry_.size() == 0) {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (!registry_.has_live_socket()) {
         if (stale_completions_ != 0 || dispatch_failures_ != 0) {
           ELOG_INFO << "URMA shared JFC: dropped " << stale_completions_
-                    << " completion(s) for detached sockets, "
+                    << " completion(s) for detached sockets or constructed by "
+                       "hardware, "
                     << dispatch_failures_ << " dispatch exception(s)";
         }
         alive_.store(false, std::memory_order_relaxed);
@@ -574,12 +629,27 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     schedule();
   }
 
+  // A socket callback resumes application coroutines. A throwing callback must
+  // not kill the group's poll loop (which would silently stop every socket on
+  // this io_context), so catch per completion and keep draining.
+  void deliver_guarded(jfc_group_socket& socket, const urma_cr_t& cr) {
+    try {
+      jfc_group_registry::deliver(socket, cr);
+    } catch (const std::exception& e) {
+      ++dispatch_failures_;
+      ELOG_ERROR << "URMA shared JFC dispatch threw: " << e.what();
+    } catch (...) {
+      ++dispatch_failures_;
+      ELOG_ERROR << "URMA shared JFC dispatch threw an unknown exception";
+    }
+  }
+
   void fail_all(std::error_code ec) {
     // Publish the failure while holding the same mutex attach() uses, and set
     // failed_ first: a concurrent attach then either sees it (and returns -3)
     // or is ordered before this and gets covered by for_each below.
     {
-      std::lock_guard<std::mutex> lock(registry_mutex());
+      std::lock_guard<std::mutex> lock(state_mutex_);
       failed_.store(true, std::memory_order_relaxed);
       alive_.store(false, std::memory_order_relaxed);
       polling_.store(false, std::memory_order_relaxed);
@@ -612,8 +682,13 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return *value;
   }
 
+  // Completions drained per urma_poll_jfc call.
+  static constexpr std::size_t kPollBatch = 16;
+
   asio::any_io_executor executor_;
   std::unique_ptr<urma_jfc_t, jfc_deleter> jfc_;
+  // Orders attach() against fail_all() and the poll loop's idle exit.
+  std::mutex state_mutex_;
   jfc_group_registry registry_;
   uint32_t io_rate_ = 8;
   uint32_t cq_size_ = 0;

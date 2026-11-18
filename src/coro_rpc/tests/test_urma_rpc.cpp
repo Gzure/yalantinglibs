@@ -13,7 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <array>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <variant>
 #include <vector>
@@ -511,6 +513,80 @@ TEST_CASE(
   // max_wr == 0 means "no capacity accounting".
   jfc_group_registry unbounded(/*max_wr=*/0);
   CHECK(unbounded.attach(std::make_shared<mock_group_socket>(), 1000000) >= 0);
+}
+
+TEST_CASE("urma jfc group registry drops hardware-constructed records") {
+  using coro_io::detail::is_hw_constructed_cr;
+  using coro_io::detail::jfc_group_registry;
+  using coro_io::detail::urma_ctx_op;
+
+  jfc_group_registry registry(/*max_wr=*/512);
+  auto victim = std::make_shared<mock_group_socket>();
+  const int sid = registry.attach(victim, 64);
+  REQUIRE(sid >= 0);
+
+  // SUSPEND_DONE / FLUSH_ERR_DONE are faked by the hardware and carry an
+  // invalid user_ctx. Even when that garbage happens to decode to a live sid,
+  // the record must not reach the socket: a zero-length recv would otherwise
+  // be taken as a peer close and shut a healthy connection down.
+  for (auto status : {URMA_CR_WR_SUSPEND_DONE, URMA_CR_WR_FLUSH_ERR_DONE}) {
+    auto recv_cr = make_group_cr(urma_ctx_op::recv, sid, 1);
+    recv_cr.status = status;
+    CHECK(is_hw_constructed_cr(recv_cr));
+    CHECK_FALSE(registry.dispatch(recv_cr));
+    auto send_cr = make_group_cr(urma_ctx_op::send, sid, 1);
+    send_cr.status = status;
+    CHECK_FALSE(registry.dispatch(send_cr));
+  }
+  CHECK(victim->recvs == 0);
+  CHECK(victim->sends == 0);
+
+  // A real error completion still carries a valid user_ctx and is delivered,
+  // so the owning socket can fail its pending work.
+  auto flushed = make_group_cr(urma_ctx_op::send, sid, 2);
+  flushed.status = URMA_CR_WR_FLUSH_ERR;
+  CHECK_FALSE(is_hw_constructed_cr(flushed));
+  CHECK(registry.dispatch(flushed));
+  CHECK(victim->sends == 1);
+}
+
+TEST_CASE("urma jfc group registry resolves a completion batch at once") {
+  using coro_io::detail::jfc_group_registry;
+  using coro_io::detail::jfc_group_socket;
+  using coro_io::detail::urma_ctx_op;
+
+  jfc_group_registry registry(/*max_wr=*/512);
+  auto a = std::make_shared<mock_group_socket>();
+  auto b = std::make_shared<mock_group_socket>();
+  const int sid_a = registry.attach(a, 64);
+  const int sid_b = registry.attach(b, 64);
+  REQUIRE(sid_a >= 0);
+  REQUIRE(sid_b >= 0);
+  CHECK(registry.has_live_socket());
+
+  std::array<urma_cr_t, 4> batch{
+      make_group_cr(urma_ctx_op::send, sid_a, 1),
+      make_group_cr(urma_ctx_op::recv, sid_b, 1),
+      make_group_cr(urma_ctx_op::send, 9999u, 1),  // unknown sid
+      make_group_cr(urma_ctx_op::recv, sid_a, 1)};
+  batch[1].status = URMA_CR_WR_FLUSH_ERR_DONE;  // faked: must be dropped
+  std::array<std::shared_ptr<jfc_group_socket>, 4> owners{};
+  CHECK(registry.resolve(batch.data(), batch.size(), owners.data()) == 2);
+  CHECK(owners[0].get() == a.get());
+  CHECK(owners[1] == nullptr);
+  CHECK(owners[2] == nullptr);
+  CHECK(owners[3].get() == a.get());
+
+  for (std::size_t i = 0; i < batch.size(); ++i)
+    if (owners[i])
+      jfc_group_registry::deliver(*owners[i], batch[i]);
+  CHECK(a->sends == 1);
+  CHECK(a->recvs == 1);
+  CHECK(b->recvs == 0);
+
+  CHECK(registry.detach(sid_a));
+  CHECK(registry.detach(sid_b));
+  CHECK_FALSE(registry.has_live_socket());
 }
 
 TEST_CASE("urma seq slot ring rejects a completion whose seq tag differs") {

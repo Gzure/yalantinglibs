@@ -526,6 +526,12 @@ struct urma_socket_shared_state_t
         return {std::make_error_code(std::errc::io_error), polled};
       polled += static_cast<std::size_t>(count);
       for (int i = 0; i < count; ++i) {
+        // A hardware-constructed record does not complete any posted WR:
+        // matching it would pop an unrelated pending send / recv buffer.
+        if (is_hw_constructed_cr(completions[i])) {
+          log_hw_constructed_cr(completions[i]);
+          continue;
+        }
         if (completions[i].flag.bs.s_r == 0)
           on_send_completion(completions[i]);
         else
@@ -544,7 +550,26 @@ struct urma_socket_shared_state_t
                << ", user_ctx=" << cr.user_ctx << ", local_id=" << cr.local_id;
   }
 
+  static void log_hw_constructed_cr(const urma_cr_t& cr) {
+    ELOG_WARN << "URMA dropped hardware-constructed completion: status="
+              << static_cast<int>(cr.status)
+              << ", direction=" << (cr.flag.bs.s_r ? "recv" : "send")
+              << ", local_id=" << cr.local_id;
+  }
+
+  // An error completion means the jetty (or its transport) has failed: every
+  // later WR would only flush. Fail all pending work and close instead of
+  // re-posting into the failed jetty.
+  void fail_on_error_completion(std::error_code ec) {
+    fail_pending(ec);
+    close();
+  }
+
   void on_send_completion(const urma_cr_t& cr) override {
+    // close() already settled every pending send; a completion that arrives
+    // afterwards (e.g. later in the same poll batch) has nothing to match.
+    if (has_close_)
+      return;
     const auto ec = cr.status == URMA_CR_SUCCESS
                         ? std::error_code{}
                         : std::make_error_code(std::errc::io_error);
@@ -557,6 +582,10 @@ struct urma_socket_shared_state_t
       if (pending.buffer)
         buffer_pool_->return_buffer(pending.buffer);
       resume({ec, pending.length}, std::move(pending.callback));
+      if (ec) {
+        fail_on_error_completion(ec);
+        return;
+      }
       wake_writer(ec);
       return;
     }
@@ -568,25 +597,44 @@ struct urma_socket_shared_state_t
       ELOG_ERROR << "URMA send completion without a matching slot: seq="
                  << ctx.seq << ", sid=" << ctx.sid
                  << ", user_ctx=" << cr.user_ctx;
+      if (ec)
+        fail_on_error_completion(ec);
       return;
     }
     if (pending->buffer)
       buffer_pool_->return_buffer(pending->buffer);
     resume({ec, pending->length}, std::move(pending->callback));
+    if (ec) {
+      fail_on_error_completion(ec);
+      return;
+    }
     wake_writer(ec);
   }
 
   void on_recv_completion(const urma_cr_t& cr) override {
-    const auto ec = cr.status == URMA_CR_SUCCESS
-                        ? std::error_code{}
-                        : std::make_error_code(std::errc::io_error);
-    if (ec)
-      log_completion_error(cr);
+    // close() already failed the pending receive; posted buffers still in
+    // recv_queue_ are returned by release_resources().
+    if (has_close_)
+      return;
     if (recv_queue_.empty()) {
       fail_pending(std::make_error_code(std::errc::protocol_error));
       close();
       return;
     }
+    if (cr.status != URMA_CR_SUCCESS) {
+      // Check the status before completion_len: an error record usually has
+      // completion_len == 0 and used to be mistaken for a peer close, and an
+      // error record with a length used to refill the queue, re-posting into a
+      // failed jfr and producing another flush record.
+      log_completion_error(cr);
+      // The record completed (flushed) the oldest posted buffer, so the
+      // hardware no longer owns it.
+      auto flushed = recv_queue_.pop();
+      buffer_pool_->return_buffer(flushed);
+      fail_on_error_completion(std::make_error_code(std::errc::io_error));
+      return;
+    }
+    const std::error_code ec{};
     if (cr.completion_len == 0) {
       peer_close_ = true;
       // The zero-length completion consumed one posted recv buffer: give it

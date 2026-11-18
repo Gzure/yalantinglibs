@@ -73,6 +73,10 @@ struct options_t {
   std::string device = "bonding_dev_0";
   int eid_index = 0;
   std::string event_mode = "true";
+  bool event_mode_set = false;
+  // One JFC per io_context instead of one per connection. Only exists in poll
+  // mode, so it also selects --event-mode false unless that was given.
+  bool shared_jfc = true;
   uint32_t payload_size = 64;
   uint32_t latency_iters = 10000;
   uint32_t warmup_iters = 1000;
@@ -120,6 +124,7 @@ void configure_urma_rpc_env(const options_t& opt) {
   set_process_env("URMA_RPC_TP_TYPE", "ctp");
   set_process_env("URMA_RPC_PRIORITY", std::to_string(opt.priority));
   set_process_env("URMA_RPC_EVENT_MODE", opt.event_mode);
+  set_process_env("URMA_RPC_SHARED_JFC", opt.shared_jfc ? "1" : "0");
 }
 
 void print_usage(const char* program) {
@@ -143,7 +148,10 @@ void print_usage(const char* program) {
       << "  --max-memory-mib <n>     URMA buffer pool memory per process. "
          "Default 256, auto-raised when needed\n"
       << "  --no-urma               Use TCP instead of URMA RPC. Default URMA\n"
-      << "  --event-mode <true|false> URMA event mode. Default true\n"
+      << "  --event-mode <true|false> URMA event mode. Default true, or "
+         "false with --shared-jfc true\n"
+      << "  --shared-jfc <true|false> One JFC per io_context (poll mode "
+         "only; sets URMA_RPC_SHARED_JFC). Default true\n"
       << "  --profile                Enable in-memory stage latency profiling. "
          "Default off\n"
       << "  --profile-sample-rate <n> Record one sample every n events per "
@@ -266,7 +274,16 @@ options_t parse_options(int argc, char** argv) {
     else if (key == "--no-urma") {
       opt.use_urma = false;
     }
+    else if (key == "--shared-jfc") {
+      auto value = require_value();
+      if (value != "true" && value != "false") {
+        throw std::invalid_argument(
+            "--shared-jfc must be true or false, got: " + std::string(value));
+      }
+      opt.shared_jfc = value == "true";
+    }
     else if (key == "--event-mode") {
+      opt.event_mode_set = true;
       auto value = require_value();
       if (value == "true") {
         opt.event_mode = "true";
@@ -347,6 +364,18 @@ options_t parse_options(int argc, char** argv) {
   if (opt.role == "server" && !host_was_set) {
     opt.host = "0.0.0.0";
   }
+  // The shared JFC only exists in poll mode: without an explicit
+  // --event-mode it selects poll mode, otherwise it would silently fall back
+  // to one JFC per connection.
+  if (opt.shared_jfc && !opt.event_mode_set) {
+    opt.event_mode = "false";
+  }
+  else if (opt.shared_jfc && opt.event_mode == "true") {
+    status(
+        "warning: --shared-jfc needs --event-mode false; every connection "
+        "keeps its own JFC");
+    opt.shared_jfc = false;
+  }
   return opt;
 }
 
@@ -393,7 +422,9 @@ coro_io::urma_socket_t::config_t make_urma_config(const options_t& opt) {
       .device_name = opt.device,
       .eid_index = opt.eid_index,
       .tp_type = URMA_CTP,
-      .jfs_priority = opt.priority};
+      .jfs_priority = opt.priority,
+      .event_mode = opt.event_mode == "true",
+      .shared_jfc = opt.shared_jfc};
 }
 
 bool init_global_urma(const options_t& opt) {
@@ -877,6 +908,12 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
     auto opt = parse_options(argc, argv);
+    if (opt.use_urma) {
+      status(std::string("URMA completion: ") +
+             (opt.event_mode == "true" ? "event mode"
+              : opt.shared_jfc         ? "poll mode, shared JFC per io_context"
+                                       : "poll mode, one JFC per connection"));
+    }
     coro_io::urma_benchmark_profile::configure(false, opt.profile_sample_rate);
     easylog::logger<>::instance().set_min_severity(opt.log_level);
     easylog::logger<>::instance().set_async(false);

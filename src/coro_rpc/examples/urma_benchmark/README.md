@@ -125,6 +125,12 @@ Throughput only:
 --queue-depth <n>        URMA send/recv queue depth. Default 64
 --max-memory-mib <n>     URMA buffer pool memory per process. Default 256,
                          auto-raised when payload/connections need more
+--shared-jfc <true|false> One JFC per io_context shared by all its
+                         connections (URMA_RPC_SHARED_JFC). Default true.
+                         Poll mode only: it selects --event-mode false
+                         unless --event-mode is given
+--event-mode <true|false> URMA event-driven completion. Default true, or
+                         false when --shared-jfc is true
 --profile                Enable in-memory stage latency profiling. Default off.
 --profile-sample-rate <n> Record one sample every n events per stage/thread.
                          Default 1.
@@ -160,6 +166,13 @@ Server-only option:
 ## Notes
 
 - The default URMA transport type is CTP.
+- Completion detection defaults to poll mode with a shared JFC per io_context
+  (`--shared-jfc true`): one poll loop per server/client thread instead of
+  one per connection, and the loop sleeps on the JFC's completion event after
+  `URMA_RPC_SHARED_JFC_IDLE_US` (default 1000) without completions, so idle
+  threads do not keep a core busy. The benchmark prints the mode it runs at
+  startup. Use `--shared-jfc false` for the previous one-JFC-per-connection
+  behavior, and `--event-mode true` for event-driven completion.
 - Server mode defaults to `--host 0.0.0.0`, so cross-node tests work without
   explicitly overriding the listen address. Client mode defaults to
   `127.0.0.1`.

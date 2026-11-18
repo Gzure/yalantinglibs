@@ -16,6 +16,9 @@
 #pragma once
 
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <urma_api.h>
 #include <urma_ubagg.h>
@@ -1037,6 +1040,78 @@ struct urma_socket_shared_state_t
   }
 
   // Start the completion watcher; event-driven loop or legacy busy poll.
+  // URMA has no connection state: a peer that exits, crashes or loses its
+  // host is never reported, and its sockets here would stay open (and, in
+  // poll mode, keep spinning) forever. The TCP connection of the handshake is
+  // therefore kept as the liveness channel. Nothing is sent on it after the
+  // handshake: the kernel closes it when the peer process ends in any way,
+  // close() closes ours, and keepalive covers a host that disappears.
+  //
+  // Older peers close it right after the handshake. An EOF within
+  // kLegacyPeerCloseWindow of the handshake is taken as such a peer: the
+  // connection stays up, without exit detection, as before.
+  void start_tcp_liveness() {
+    handshake_done_ = std::chrono::steady_clock::now();
+    enable_tcp_keepalive();
+    watch_tcp_liveness();
+  }
+
+  void enable_tcp_keepalive() {
+    std::error_code ec;
+    socket_.set_option(asio::socket_base::keep_alive(true), ec);
+    if (ec) {
+      ELOG_WARN << "URMA liveness: SO_KEEPALIVE failed: " << ec.message();
+      return;
+    }
+    const int fd = socket_.native_handle();
+    const int idle = kKeepaliveIdleSeconds,
+              interval = kKeepaliveIntervalSeconds, count = kKeepaliveProbes;
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) != 0 ||
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval,
+                     sizeof(interval)) != 0 ||
+        ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count)) !=
+            0) {
+      ELOG_WARN << "URMA liveness: TCP keepalive tuning failed: errno=" << errno
+                << "; the system defaults apply";
+    }
+  }
+
+  void watch_tcp_liveness() {
+    std::weak_ptr<urma_socket_shared_state_t> weak = weak_from_this();
+    socket_.async_read_some(asio::buffer(tcp_probe_),
+                            [weak](const std::error_code& ec, std::size_t n) {
+                              if (auto self = weak.lock())
+                                self->on_tcp_liveness(ec, n);
+                            });
+  }
+
+  void on_tcp_liveness(const std::error_code& ec, std::size_t n) {
+    if (has_close_)
+      return;  // our own close() cancelled the read
+    if (!ec && n > 0) {
+      // The protocol sends nothing after the handshake: ignore and go on.
+      watch_tcp_liveness();
+      return;
+    }
+    std::error_code ignored;
+    if (std::chrono::steady_clock::now() - handshake_done_ <
+        kLegacyPeerCloseWindow) {
+      ELOG_INFO << "URMA peer of jetty " << local_jetty_id_
+                << " closed the handshake TCP connection right after the "
+                   "handshake (peer without TCP liveness); its exit will not "
+                   "be detected";
+      socket_.close(ignored);
+      return;
+    }
+    ELOG_INFO << "URMA peer of jetty " << local_jetty_id_
+              << " is gone (handshake TCP connection: "
+              << (ec ? ec.message() : std::string("end of stream"))
+              << "); closing the socket";
+    peer_close_ = true;
+    fail_pending(std::make_error_code(std::errc::connection_reset));
+    close();
+  }
+
   void start_completion_watch() {
     if (group_) {
       ELOG_INFO << "URMA completion detection: mode=shared-jfc-poll"
@@ -1344,6 +1419,13 @@ struct urma_socket_shared_state_t
   std::optional<async_simple::Promise<std::error_code>> write_promise_;
   std::atomic<bool> has_close_{false};
   bool peer_close_ = false;
+  // TCP liveness channel (see start_tcp_liveness()).
+  static constexpr std::chrono::seconds kLegacyPeerCloseWindow{2};
+  static constexpr int kKeepaliveIdleSeconds = 10;
+  static constexpr int kKeepaliveIntervalSeconds = 5;
+  static constexpr int kKeepaliveProbes = 3;
+  std::array<char, 1> tcp_probe_{};
+  std::chrono::steady_clock::time_point handshake_done_{};
   bool event_mode_enabled_ = false;
   std::size_t busy_poll_budget_ = 16;
   std::size_t pending_poll_budget_ = 1;
@@ -1429,6 +1511,12 @@ class urma_socket_t {
     // instead of spinning; the next completion wakes it. 0 = always spin
     // (one busy core per reactor thread even with no traffic).
     uint32_t shared_jfc_idle_us = 1000;
+    // Keep the handshake TCP connection open as a liveness channel, so that a
+    // peer that exits or crashes closes its sockets here (see
+    // start_tcp_liveness()). false restores the old behavior: the TCP
+    // connection is closed after the handshake and a vanished peer is never
+    // noticed. Costs one fd per connection.
+    bool tcp_liveness = true;
   };
 
   enum io_type { recv = 0, send = 1 };
@@ -1560,7 +1648,7 @@ class urma_socket_t {
     if (write_ec)
       co_return write_ec;
     record_handshake_endpoints();
-    close_handshake_socket();
+    finish_handshake_socket();
     state_->start_completion_watch();
     co_return std::error_code{};
   }
@@ -1907,7 +1995,7 @@ class urma_socket_t {
     if (ec)
       co_return ec;
     record_handshake_endpoints();
-    close_handshake_socket();
+    finish_handshake_socket();
     coro_io::urma_benchmark_profile::record_since_with_size(
         coro_io::urma_benchmark_profile::stage::client_connect_handshake,
         handshake_begin, 0);
@@ -1944,6 +2032,13 @@ class urma_socket_t {
     if (!state_->recv_buffer_)
       return;
     state_->buffer_pool_->return_buffer(state_->recv_buffer_);
+  }
+
+  void finish_handshake_socket() {
+    if (conf_.tcp_liveness)
+      state_->start_tcp_liveness();
+    else
+      close_handshake_socket();
   }
 
   void close_handshake_socket() {

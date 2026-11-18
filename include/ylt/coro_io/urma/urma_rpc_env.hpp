@@ -211,6 +211,8 @@ inline coro_io::urma_socket_t::config_t make_urma_rpc_config_from_env() {
                                ? min_group_cq_size
                                : max_group_cq_size;
   }
+  config.tcp_liveness =
+      urma_rpc_env_flag("URMA_RPC_TCP_LIVENESS", /*default*/ true);
   urma_rpc_parse_env_integer("URMA_RPC_SHARED_JFC_IDLE_US",
                              config.shared_jfc_idle_us);
   constexpr uint32_t max_shared_jfc_idle_us = 1000000;
@@ -260,7 +262,8 @@ inline std::optional<coro_io::urma_socket_t::config_t> probe_urma_rpc_config(
               << ", override=" << config.poll_rounds << ")"
               << ", shared_jfc=" << (config.shared_jfc ? "on" : "off")
               << ", group_cq_size=" << config.group_cq_size
-              << ", shared_jfc_idle_us=" << config.shared_jfc_idle_us;
+              << ", shared_jfc_idle_us=" << config.shared_jfc_idle_us
+              << ", tcp_liveness=" << (config.tcp_liveness ? "on" : "off");
     return config;
   } catch (const std::exception& e) {
     ELOG_WARN << "URMA RPC auto enable failed: " << e.what()

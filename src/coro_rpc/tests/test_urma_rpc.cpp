@@ -353,6 +353,21 @@ TEST_CASE("urma rpc shared jfc env defaults and clamping") {
     auto config = coro_io::detail::make_urma_rpc_config_from_env();
     CHECK(config.shared_jfc_idle_us == 1000);  // invalid: default kept
   }
+}
+
+TEST_CASE("urma rpc env tcp liveness defaults to on") {
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    // The handshake TCP connection stays open so a vanished peer is noticed.
+    CHECK(config.tcp_liveness == true);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var liveness("URMA_RPC_TCP_LIVENESS", "0");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.tcp_liveness == false);
+  }
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
     scoped_env_var shared("URMA_RPC_SHARED_JFC", "on");

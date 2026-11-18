@@ -21,8 +21,10 @@
 #include <poll.h>
 #include <urma_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -148,6 +150,8 @@ class urma_async_event_hub {
   };
 
   static constexpr int kPollTimeoutMs = 100;
+  static constexpr std::chrono::milliseconds kMaxBackoff{100};
+  static constexpr uint32_t kFailureLogInterval = 600;  // ~1 min at the cap
 
   void start_locked() {
     if (thread_.joinable() || stop_.load(std::memory_order_acquire) ||
@@ -184,11 +188,36 @@ class urma_async_event_hub {
       if (rc == 0)
         continue;
       urma_async_event_t event{};
-      if (urma_get_async_event(context_, &event) != URMA_SUCCESS)
+      errno = 0;
+      const urma_status_t status = urma_get_async_event(context_, &event);
+      if (status != URMA_SUCCESS) {
+        back_off_after_failure(status);
         continue;
+      }
+      consecutive_failures_ = 0;
       handle(event);
       urma_ack_async_event(&event);
     }
+  }
+
+  // The fd polled readable but no event could be fetched. Its readiness is
+  // the provider's (e.g. a bonding device's) and may not clear when nothing
+  // is fetchable, so going straight back to poll() would spin a whole core
+  // (seen: ~4.4M calls/s). Back off exponentially up to kMaxBackoff; events
+  // are still watched, at most kMaxBackoff late.
+  void back_off_after_failure(urma_status_t status) {
+    ++consecutive_failures_;
+    if (consecutive_failures_ == 1 ||
+        consecutive_failures_ % kFailureLogInterval == 0) {
+      ELOG_WARN << "urma_get_async_event failed although the async fd "
+                << context_->async_fd << " is readable: status=" << status
+                << ", errno=" << errno
+                << ", consecutive failures=" << consecutive_failures_
+                << "; backing off up to " << kMaxBackoff.count() << "ms";
+    }
+    const auto shift = std::min<uint32_t>(consecutive_failures_, 7);
+    std::this_thread::sleep_for(
+        std::min(std::chrono::milliseconds(1LL << shift), kMaxBackoff));
   }
 
   void handle(const urma_async_event_t& event) {
@@ -237,6 +266,7 @@ class urma_async_event_hub {
   std::unordered_map<const void*, entry> subscribers_;
   std::thread thread_;
   std::atomic<bool> stop_{false};
+  uint32_t consecutive_failures_ = 0;  // watcher thread only
 };
 
 }  // namespace coro_io

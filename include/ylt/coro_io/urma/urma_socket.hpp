@@ -259,9 +259,14 @@ struct urma_socket_shared_state_t
       // get() returns a group with room or adds one; a concurrent attach can
       // still fill it first (-2), and the second get() then adds a group.
       for (int attempt = 0; attempt < 2 && sid < 0; ++attempt) {
-        group_ = urma_jfc_group::get(
-            executor_, device_->context(), group_cq_size_, cap.max_jfc_depth,
-            io_rate_, wr_reserve, device_->async_events());
+        urma_jfc_group::options opts;
+        opts.cq_size = group_cq_size_;
+        opts.max_cq_depth = cap.max_jfc_depth;
+        opts.io_rate = io_rate_;
+        opts.wr_reserve = wr_reserve;
+        opts.idle_wait = shared_jfc_idle_wait_;
+        opts.async_events = device_->async_events();
+        group_ = urma_jfc_group::get(executor_, device_->context(), opts);
         if (!group_ || !group_->valid())
           break;
         sid = group_->attach(shared_from_this(), wr_reserve);
@@ -1297,6 +1302,7 @@ struct urma_socket_shared_state_t
   std::atomic<int> group_sid_{-1};
   bool shared_jfc_ = false;
   uint32_t group_cq_size_ = 2048;
+  std::chrono::microseconds shared_jfc_idle_wait_{1000};
   uint32_t send_seq_ = 0;
   uint32_t recv_seq_ = 0;
   std::unique_ptr<seq_slot_ring<pending_send>> send_slots_;
@@ -1415,8 +1421,14 @@ class urma_socket_t {
     bool shared_jfc = false;
     // Depth of the shared JFC. Must cover the in-flight work requests of every
     // socket in the group: roughly sockets * (recv_buffer_cnt +
-    // send_buffer_cnt + slack). Clamped to the device max_jfc_depth.
+    // send_buffer_cnt + slack). Clamped to the device max_jfc_depth. A full
+    // group spills new sockets into another group (another JFC).
     uint32_t group_cq_size = 2048;
+    // Shared JFC only: after this many microseconds without a completion the
+    // group's poll loop arms the JFC and sleeps on its completion event
+    // instead of spinning; the next completion wakes it. 0 = always spin
+    // (one busy core per reactor thread even with no traffic).
+    uint32_t shared_jfc_idle_us = 1000;
   };
 
   enum io_type { recv = 0, send = 1 };
@@ -1740,6 +1752,8 @@ class urma_socket_t {
             : detail::poll_rounds_from_io_rate(conf_.io_rate);
     state_->shared_jfc_ = conf_.shared_jfc;
     state_->group_cq_size_ = conf_.group_cq_size;
+    state_->shared_jfc_idle_wait_ =
+        std::chrono::microseconds(conf_.shared_jfc_idle_us);
     if (!state_->init(conf_.cq_size, conf_.send_buffer_cnt, conf_.event_mode,
                       conf_.jfs_priority, conf_.tp_type)) {
       auto stage = state_->init_stage_;

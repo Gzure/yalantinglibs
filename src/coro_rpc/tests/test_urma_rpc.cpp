@@ -332,6 +332,26 @@ TEST_CASE("urma rpc shared jfc env defaults and clamping") {
     // several jetties on one completion queue.
     CHECK(config.shared_jfc == false);
     CHECK(config.group_cq_size == 2048);
+    // The shared poll loop sleeps after 1ms without completions by default.
+    CHECK(config.shared_jfc_idle_us == 1000);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var idle("URMA_RPC_SHARED_JFC_IDLE_US", "0");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.shared_jfc_idle_us == 0);  // always spin
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var idle("URMA_RPC_SHARED_JFC_IDLE_US", "99999999");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.shared_jfc_idle_us == 1000000);
+  }
+  {
+    scoped_env_var enable("URMA_RPC_ENABLE", "1");
+    scoped_env_var idle("URMA_RPC_SHARED_JFC_IDLE_US", "abc");
+    auto config = coro_io::detail::make_urma_rpc_config_from_env();
+    CHECK(config.shared_jfc_idle_us == 1000);  // invalid: default kept
   }
   {
     scoped_env_var enable("URMA_RPC_ENABLE", "1");
@@ -774,7 +794,8 @@ TEST_CASE("urma io_rate percentage maps to poll rounds per yield") {
 TEST_CASE("urma shared jfc group needs an executor and a device context") {
   using coro_io::detail::urma_jfc_group;
   // Degenerate inputs must fail instead of dereferencing a null executor.
-  CHECK(urma_jfc_group::get(nullptr, nullptr, 1024, 0, 50) == nullptr);
+  CHECK(urma_jfc_group::get(nullptr, nullptr, urma_jfc_group::options{}) ==
+        nullptr);
 }
 
 TEST_CASE("urma async event hub routes object errors to live subscribers") {

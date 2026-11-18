@@ -120,7 +120,8 @@ export URMA_RPC_EID_INDEX=0
 | `URMA_RPC_IO_RATE` | spin 模式下**用于轮询 CQ 的时间占比（百分比）**，1~99，默认 `50`（= 每让出一次 io_context 前连续 poll 8 轮，与旧默认行为一致）。换算：`rounds = 8 × P / (100 − P)`（一次让出的 io_context 迭代 ≈ 8 次 poll 的开销）：`50→8`、`80→32`、`90→72`、`95→152`、`99→792`。越大 → 完成检测越及时，但 handler/fd/timer 处理越晚；`100` 会被钳到 `99`，因为循环必须让出才能处理 accept/fd/定时器 |
 | `URMA_RPC_POLL_ROUNDS` | 直接指定**每让出一次 io_context 前连续 poll 的轮数**（1~1024），非 0 时覆盖 `URMA_RPC_IO_RATE`；用于百分比估算与实际机器不符的精确调参，默认 `0`（由百分比换算） |
 | `URMA_RPC_SHARED_JFC` | `1` 时同一 io_context 的所有 URMA socket **共用一个 JFC**（`urma_jetty_cfg_t.shared.jfc`）：一个 poll loop 抽干组的 CQE，并按 `user_ctx`（sid/op/seq 编码）在**同一 reactor 线程内**分发给对应 socket。默认 `0`（每 socket 一个 JFC）。仅 poll 模式（`URMA_RPC_EVENT_MODE=0`）生效，event 模式自动回退到 per-socket JFC。收益：每次 tick 的 `urma_poll_jfc` 从 N 次降到 1 次、post 链从 N 条降到 1 条、JFC 资源从 N 个降到 1 个；代价：需要驱动支持多 jetty 共享 JFC，且 CQ 溢出会影响组内所有连接 |
-| `URMA_RPC_GROUP_CQ_SIZE` | 共享 JFC 的深度，默认 `2048`，范围 64~65536（创建时再按设备 `max_jfc_depth` 钳制）。必须覆盖组内所有 socket 的在途 WR，约 `sockets × (recv_buffer_cnt + send_buffer_cnt + 4)`；不够时 `attach` 失败并自动回退 per-socket JFC |
+| `URMA_RPC_GROUP_CQ_SIZE` | 共享 JFC 的深度，默认 `2048`，范围 64~65536（创建时再按设备 `max_jfc_depth` 钳制）。必须覆盖组内所有 socket 的在途 WR，约 `sockets × (recv_buffer_cnt + send_buffer_cnt + 4)`；组满后新 socket 会在同一 io_context 上**再建一个组**（多一个 JFC），不再回退 per-socket JFC；只有单个 socket 的需求就超过组深度、或 JFC 创建失败时才回退 |
+| `URMA_RPC_SHARED_JFC_IDLE_US` | 共享 JFC 的空闲休眠阈值（微秒），默认 `1000`，范围 0~1000000。连续这么久没有完成记录后，组的 poll loop 会 arm JFC 并在 jfce fd 上休眠，下一个完成事件把它唤醒后继续 spin；有流量时行为与纯 spin 相同，只有空闲后的第一个完成多付一次事件唤醒（组会把 JFC 中断合并设为每个 CQE 一个事件）。`0` = 永远 spin（无流量时每个 reactor 线程也占满一个核）。jfce 创建失败时自动退回纯 spin |
 
 **共享 JFC 的容量估算**：默认 `RECV_BUFFER_CNT=8 / SEND_BUFFER_CNT=4` 时每 socket 约 16 个在途 WR，`GROUP_CQ_SIZE=2048` 可容纳约 128 个 socket；若按吞吐配置 `128/128`，每 socket 约 260 个 WR，4 个 socket 就需要 ≥1040，建议直接把 `GROUP_CQ_SIZE` 设到 4096 或降低 buffer 数。共享 JFC 属于**未在硬件上充分验证**的能力，建议先用 `URMA_RPC_SHARED_JFC=0` 建立基线，再以 `1` 做 A/B，并观察 `URMA shared JFC`、`attach failed`、`poll failed` 日志。
 

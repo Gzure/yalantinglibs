@@ -17,6 +17,7 @@
 
 #ifdef YLT_ENABLE_URMA
 
+#include <fcntl.h>
 #include <urma_api.h>
 #include <urma_ubagg.h>
 
@@ -24,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -37,6 +39,7 @@
 #include <vector>
 
 #include "asio/any_io_executor.hpp"
+#include "asio/posix/stream_descriptor.hpp"
 #include "asio/post.hpp"
 #include "ylt/coro_io/coro_io.hpp"
 #include "ylt/coro_io/urma/urma_async_event.hpp"
@@ -57,6 +60,13 @@ namespace coro_io::detail {
 // Only used in poll mode (event_mode=false); the event-driven path keeps its
 // per-socket jfce, which the socket layer falls back to when sharing is not
 // possible.
+//
+// Idle wait: spinning keeps a whole core busy even with no traffic at all
+// (idle connections in a pool, a client between bursts). With idle_wait > 0
+// the JFC is bound to a jfce, and once no completion arrived for idle_wait
+// the loop arms the JFC and sleeps on the jfce fd until the next completion
+// event; then it spins again. Under load nothing changes; only the first
+// completion after an idle period pays the event wake-up.
 // ---------------------------------------------------------------------------
 class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
  public:
@@ -65,6 +75,26 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
       if (value)
         urma_delete_jfc(value);
     }
+    void operator()(urma_jfce_t* value) const {
+      if (value)
+        urma_delete_jfce(value);
+    }
+  };
+
+  struct options {
+    uint32_t cq_size = 2048;
+    uint32_t max_cq_depth = 0;  // device max_jfc_depth, 0 = unknown
+    uint32_t io_rate = 8;       // poll rounds per tick
+    // Work requests the requesting socket will reserve: get() returns a group
+    // with that much room, or adds one.
+    uint32_t wr_reserve = 0;
+    // Sleep on the JFC's completion event after this long without a
+    // completion; 0 = always spin.
+    std::chrono::microseconds idle_wait{0};
+    // The device's async event hub: the group subscribes its JFC, so a JFC
+    // error event (e.g. an overflow) fails every attached socket instead of
+    // leaving them on a JFC that never completes.
+    std::shared_ptr<urma_async_event_hub> async_events;
   };
 
   // executor and urma_context together identify a group: one io_context may in
@@ -76,14 +106,13 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   // as long as the group lives, so a recycled address cannot route a socket to
   // a stale group.
   //
-  // async_events (optional) is the device's async event hub: the group
-  // subscribes its JFC, so a JFC error event (e.g. an overflow) fails every
-  // attached socket instead of leaving them on a JFC that never completes.
+  // The group parameters (cq_size, io_rate, idle_wait) come from the socket
+  // that creates the group; later sockets join with whatever it was created
+  // with.
   static std::shared_ptr<urma_jfc_group> get(
       coro_io::ExecutorWrapper<>* executor, urma_context_t* context,
-      uint32_t cq_size, uint32_t max_cq_depth, uint32_t io_rate,
-      uint32_t wr_reserve = 0,
-      std::shared_ptr<urma_async_event_hub> async_events = nullptr) {
+      const options& opts) {
+    const uint32_t wr_reserve = opts.wr_reserve;
     if (!executor || !context)
       return nullptr;
     auto asio_executor = executor->get_asio_executor();
@@ -102,9 +131,9 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     // compete with the group's on the same reactor thread. The JFC is created
     // outside the process-wide lock: urma_create_jfc is a driver call and used
     // to serialize group creation for every io_context.
-    auto group = std::shared_ptr<urma_jfc_group>(
-        new urma_jfc_group(std::move(asio_executor), io_rate));
-    if (!group->init(context, cq_size, max_cq_depth))
+    auto group = std::shared_ptr<urma_jfc_group>(new urma_jfc_group(
+        std::move(asio_executor), opts.io_rate, opts.idle_wait));
+    if (!group->init(context, opts.cq_size, opts.max_cq_depth))
       return nullptr;
     if (!group->has_room(wr_reserve)) {
       // Even an empty group cannot hold this socket: adding more groups would
@@ -129,7 +158,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
       ELOG_INFO << "URMA shared JFC: io_context now has " << group_count
                 << " groups (each full group spills into a new JFC)";
     }
-    group->subscribe_async_events(std::move(async_events));
+    group->subscribe_async_events(opts.async_events);
     return group;
   }
 
@@ -138,6 +167,14 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     // Before jfc_ is deleted, so a recycled address cannot reach this group.
     if (async_events_)
       async_events_->unsubscribe(jfc_.get());
+    // The jfce owns the fd: release it from asio instead of closing it.
+    if (event_fd_) {
+      event_fd_->release();
+      event_fd_.reset();
+    }
+    // urma_delete_jfc waits until every completion event is acked. Members
+    // are then destroyed in reverse order: jfc_ before jfce_.
+    ack_jfc_events();
   }
 
   bool valid() const noexcept { return static_cast<bool>(jfc_); }
@@ -174,7 +211,10 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     return sid;
   }
 
-  void detach(int sid) { registry_.detach(sid); }
+  void detach(int sid) {
+    registry_.detach(sid);
+    wake_if_idle();
+  }
   bool bind_jetty(int sid, uint32_t jetty_id) {
     return registry_.bind_jetty(sid, jetty_id);
   }
@@ -215,8 +255,11 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
  private:
   using key_type = std::pair<void*, void*>;
 
-  urma_jfc_group(asio::any_io_executor executor, uint32_t io_rate)
+  urma_jfc_group(asio::any_io_executor executor, uint32_t io_rate,
+                 std::chrono::microseconds idle_wait)
       : executor_(std::move(executor)),
+        idle_wait_(idle_wait.count() > 0 ? idle_wait
+                                         : std::chrono::microseconds{0}),
         io_rate_(std::max<uint32_t>(io_rate, 1)) {}
 
   bool init(urma_context_t* context, uint32_t cq_size, uint32_t max_cq_depth) {
@@ -229,8 +272,8 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     }
     urma_jfc_cfg_t cfg{};
     cfg.depth = cq_size;
-    // Poll mode only: no event channel is created for the shared JFC.
-    cfg.jfce = nullptr;
+    // The event channel is only needed to sleep while idle.
+    cfg.jfce = idle_wait_.count() > 0 ? create_jfce(context) : nullptr;
     errno = 0;
     jfc_.reset(urma_create_jfc(context, &cfg));
     if (!jfc_) {
@@ -240,9 +283,55 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     }
     cq_size_ = cq_size;
     registry_.set_max_wr(cq_size);
+    if (jfce_)
+      setup_idle_wait();
     ELOG_INFO << "URMA shared JFC created: depth=" << cq_size
-              << ", io_rate=" << io_rate_;
+              << ", io_rate=" << io_rate_
+              << ", idle_wait_us=" << (event_fd_ ? idle_wait_.count() : 0);
     return true;
+  }
+
+  // Returns the jfce to bind the JFC to, or null (always spin) on failure.
+  urma_jfce_t* create_jfce(urma_context_t* context) {
+    errno = 0;
+    jfce_.reset(urma_create_jfce(context));
+    if (!jfce_ || jfce_->fd < 0) {
+      ELOG_WARN << "URMA shared JFC: urma_create_jfce failed: errno=" << errno
+                << "; the poll loop always spins";
+      jfce_.reset();
+    }
+    return jfce_.get();
+  }
+
+  // Wraps the jfce fd for asio and asks for one event per completion: the
+  // driver's default moderation batches events and would add tens to
+  // hundreds of microseconds to the first completion after an idle period.
+  void setup_idle_wait() {
+    const int flags = ::fcntl(jfce_->fd, F_GETFL);
+    if (flags < 0 || ::fcntl(jfce_->fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+      ELOG_WARN << "URMA shared JFC: jfce fd cannot be made non-blocking: "
+                   "errno="
+                << errno << "; the poll loop always spins";
+      return;
+    }
+    try {
+      event_fd_ = std::make_unique<asio::posix::stream_descriptor>(executor_,
+                                                                   jfce_->fd);
+    } catch (const std::exception& e) {
+      ELOG_WARN << "URMA shared JFC: cannot watch the jfce fd: " << e.what()
+                << "; the poll loop always spins";
+      return;
+    }
+#ifndef YLT_URMA_NO_JFC_MODERATION
+    urma_jfc_attr_t attr{};
+    attr.mask = JFC_MODERATE_COUNT;
+    attr.moderate_count = 1;
+    if (urma_modify_jfc(jfc_.get(), &attr) != URMA_SUCCESS) {
+      ELOG_WARN << "URMA shared JFC: urma_modify_jfc(moderate_count=1) failed: "
+                   "errno="
+                << errno << "; the first completion after idle may be late";
+    }
+#endif
   }
 
   void schedule() {
@@ -270,8 +359,6 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
       polling_.store(false, std::memory_order_relaxed);
       return;
     }
-    std::array<urma_cr_t, kPollBatch> completions{};
-    std::array<std::shared_ptr<jfc_group_socket>, kPollBatch> owners{};
     std::size_t delivered = 0;
     // io_rate_ bounds the poll rounds; kMaxCompletionsPerTick bounds the
     // dispatched callbacks, so a busy CQ cannot hold the reactor thread for
@@ -284,26 +371,10 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
         polling_.store(false, std::memory_order_relaxed);
         return;
       }
-      int count = urma_poll_jfc(
-          jfc_.get(), static_cast<int>(completions.size()), completions.data());
-      if (count < 0) {
-        fail_all(std::make_error_code(std::errc::io_error));
-        return;
-      }
-      if (count == 0)
-        continue;
-      const auto batch = static_cast<std::size_t>(count);
-      // One registry lock per batch instead of one per completion.
-      const std::size_t resolved =
-          registry_.resolve(completions.data(), batch, owners.data());
-      stale_completions_ += batch - resolved;
-      delivered += resolved;
-      for (std::size_t i = 0; i < batch; ++i) {
-        auto owner = std::move(owners[i]);
-        if (!owner)
-          continue;
-        deliver_guarded(*owner, completions[i]);
-      }
+      const int count = poll_batch();
+      if (count < 0)
+        return;  // the group failed
+      delivered += static_cast<std::size_t>(count);
     }
     // No attached socket: let the group be destroyed instead of keeping itself
     // alive through the posted tick. attach() restarts the loop. The registry
@@ -324,7 +395,116 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
         return;
       }
     }
+    if (event_fd_) {
+      const auto now = std::chrono::steady_clock::now();
+      if (delivered > 0)
+        last_activity_ = now;
+      else if (now - last_activity_ >= idle_wait_) {
+        try_sleep();
+        return;
+      }
+    }
     schedule();
+  }
+
+  // Polls one batch and dispatches it. Returns the number of records polled,
+  // or -1 after failing the group.
+  int poll_batch() {
+    std::array<urma_cr_t, kPollBatch> completions;
+    std::array<std::shared_ptr<jfc_group_socket>, kPollBatch> owners;
+    const int count = urma_poll_jfc(
+        jfc_.get(), static_cast<int>(completions.size()), completions.data());
+    if (count < 0) {
+      fail_all(std::make_error_code(std::errc::io_error));
+      return -1;
+    }
+    if (count == 0)
+      return 0;
+    const auto batch = static_cast<std::size_t>(count);
+    // One registry lock per batch instead of one per completion.
+    const std::size_t resolved =
+        registry_.resolve(completions.data(), batch, owners.data());
+    stale_completions_ += batch - resolved;
+    for (std::size_t i = 0; i < batch; ++i) {
+      auto owner = std::move(owners[i]);
+      if (owner)
+        deliver_guarded(*owner, completions[i]);
+    }
+    return count;
+  }
+
+  // Arms the JFC and sleeps on the jfce fd until the next completion event.
+  // urma_rearm_jfc fails while records are unread, and a record that lands
+  // between the last poll and the rearm raises no event, so poll once more
+  // after arming: only an empty poll may go to sleep.
+  void try_sleep() {
+    if (urma_rearm_jfc(jfc_.get(), false) != URMA_SUCCESS) {
+      schedule();  // records are pending: keep spinning
+      return;
+    }
+    const int count = poll_batch();
+    if (count < 0)
+      return;
+    if (count > 0) {
+      // Armed but busy again: the event raised later just wakes an awake loop
+      // early (on_wake acks it).
+      last_activity_ = std::chrono::steady_clock::now();
+      schedule();
+      return;
+    }
+    sleeping_ = true;
+    ++sleeps_;
+    auto self = shared_from_this();
+    event_fd_->async_wait(asio::posix::stream_descriptor::wait_read,
+                          [self](const std::error_code& ec) {
+                            self->on_wake(ec);
+                          });
+  }
+
+  void on_wake(const std::error_code& ec) {
+    sleeping_ = false;
+    ack_jfc_events();
+    if (ec && ec != asio::error::operation_aborted) {
+      ELOG_WARN << "URMA shared JFC: waiting on the jfce fd failed: "
+                << ec.message() << "; the poll loop always spins from now on";
+      event_fd_->release();  // the jfce owns the fd: do not close it
+      event_fd_.reset();
+    }
+    // Spin through a whole idle window again before the next sleep.
+    last_activity_ = std::chrono::steady_clock::now();
+    poll_once();
+  }
+
+  // Collects and acks the completion events of the JFC: urma_delete_jfc waits
+  // for unacked ones. time_out 0 never blocks; an armed JFC raises at most one
+  // event, so a couple of rounds cover a stale event plus a fresh one.
+  void ack_jfc_events() {
+    if (!jfce_)
+      return;
+    for (int round = 0; round < 4; ++round) {
+      urma_jfc_t* ev_jfc = nullptr;
+      if (urma_wait_jfc(jfce_.get(), 1, 0, &ev_jfc) <= 0 || !ev_jfc)
+        return;
+      uint32_t ack_cnt = 1;
+      urma_ack_jfc(&ev_jfc, &ack_cnt, 1);
+    }
+  }
+
+  // A sleeping loop only wakes on a completion: when the last socket detached
+  // (or the group failed), wake it so it can exit and release the group.
+  void wake_if_idle() {
+    if (!event_fd_)
+      return;
+    std::weak_ptr<urma_jfc_group> weak = weak_from_this();
+    asio::post(executor_, [weak] {
+      auto group = weak.lock();
+      if (!group || !group->sleeping_ || !group->event_fd_)
+        return;
+      if (group->failed() || !group->registry_.has_live_socket()) {
+        std::error_code ignored;
+        group->event_fd_->cancel(ignored);
+      }
+    });
   }
 
   // A socket callback resumes application coroutines. A throwing callback must
@@ -372,6 +552,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
       alive_.store(false, std::memory_order_relaxed);
       polling_.store(false, std::memory_order_relaxed);
     }
+    wake_if_idle();
     ELOG_ERROR << "URMA shared JFC poll failed: " << ec.message()
                << "; failing " << registry_.size() << " socket(s)";
     registry_.for_each([ec](jfc_group_socket& socket) {
@@ -423,7 +604,16 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
 
   asio::any_io_executor executor_;
   std::shared_ptr<urma_async_event_hub> async_events_;
+  // Declared before jfc_: the JFC bound to it is deleted first.
+  std::unique_ptr<urma_jfce_t, jfc_deleter> jfce_;
   std::unique_ptr<urma_jfc_t, jfc_deleter> jfc_;
+  // Idle wait (see the class comment). Touched on the executor thread only.
+  std::unique_ptr<asio::posix::stream_descriptor> event_fd_;
+  std::chrono::microseconds idle_wait_{0};
+  std::chrono::steady_clock::time_point last_activity_ =
+      std::chrono::steady_clock::now();
+  bool sleeping_ = false;
+  std::size_t sleeps_ = 0;
   // Orders attach() against fail_all() and the poll loop's idle exit.
   std::mutex state_mutex_;
   jfc_group_registry registry_;

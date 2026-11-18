@@ -62,6 +62,7 @@ class scoped_env_var {
 };
 
 #ifdef YLT_ENABLE_URMA
+#include <ylt/coro_io/urma/urma_async_event.hpp>
 #include <ylt/coro_io/urma/urma_jfc_group.hpp>
 #include <ylt/coro_io/urma/urma_rpc_env.hpp>
 
@@ -405,10 +406,23 @@ struct mock_group_socket : coro_io::detail::jfc_group_socket {
   int sends = 0;
   int recvs = 0;
   int errors = 0;
+  int hw_constructed = 0;
   void on_send_completion(const urma_cr_t&) override { ++sends; }
   void on_recv_completion(const urma_cr_t&) override { ++recvs; }
   void on_group_error(std::error_code) override { ++errors; }
+  void on_hw_constructed_completion(const urma_cr_t&) override {
+    ++hw_constructed;
+  }
 };
+
+urma_cr_t make_flush_err_done(uint32_t jetty_id) {
+  urma_cr_t cr{};
+  cr.status = URMA_CR_WR_FLUSH_ERR_DONE;
+  cr.flag.bs.jetty = 1;  // local_id is a jetty id
+  cr.local_id = jetty_id;
+  cr.user_ctx = 0xDEADBEEFCAFEull;  // documented as invalid
+  return cr;
+}
 
 urma_cr_t make_group_cr(coro_io::detail::urma_ctx_op op, uint32_t sid,
                         uint32_t seq) {
@@ -550,6 +564,88 @@ TEST_CASE("urma jfc group registry drops hardware-constructed records") {
   CHECK(victim->sends == 1);
 }
 
+TEST_CASE("urma jfc group registry routes faked records by jetty id") {
+  using coro_io::detail::jfc_group_registry;
+  using coro_io::detail::urma_ctx_op;
+
+  jfc_group_registry registry(/*max_wr=*/512);
+  auto a = std::make_shared<mock_group_socket>();
+  auto b = std::make_shared<mock_group_socket>();
+  const int sid_a = registry.attach(a, 64);
+  const int sid_b = registry.attach(b, 64);
+  REQUIRE(sid_a >= 0);
+  REQUIRE(sid_b >= 0);
+  CHECK(registry.bind_jetty(sid_a, 100));
+  CHECK(registry.bind_jetty(sid_b, 200));
+  CHECK_FALSE(registry.bind_jetty(9999, 300));  // unknown sid
+
+  // Routed by local_id, never by the garbage user_ctx, and only to the
+  // dedicated callback: it must not settle a pending send or recv.
+  CHECK(registry.dispatch(make_flush_err_done(200)));
+  CHECK(b->hw_constructed == 1);
+  CHECK(b->sends == 0);
+  CHECK(b->recvs == 0);
+  CHECK(a->hw_constructed == 0);
+
+  // local_id is only a jetty id when flag.jetty == 1; JFS/JFR ids live in
+  // other id spaces and may alias a bound jetty id.
+  auto jfr_record = make_flush_err_done(100);
+  jfr_record.flag.bs.jetty = 0;
+  CHECK_FALSE(registry.dispatch(jfr_record));
+  CHECK_FALSE(registry.dispatch(make_flush_err_done(300)));  // unbound id
+  CHECK(a->hw_constructed == 0);
+
+  // Detach drops the jetty route together with the sid.
+  CHECK(registry.detach(sid_b));
+  CHECK_FALSE(registry.dispatch(make_flush_err_done(200)));
+  CHECK(b->hw_constructed == 1);
+}
+
+namespace {
+// Re-enters the registry from its destructor, as a socket state does through
+// release_resources() -> close() -> detach().
+struct reentrant_socket : mock_group_socket {
+  coro_io::detail::jfc_group_registry* registry = nullptr;
+  int sid = -1;
+  bool* destroyed = nullptr;
+  ~reentrant_socket() override {
+    registry->detach(sid);
+    *destroyed = true;
+  }
+};
+}  // namespace
+
+TEST_CASE("urma jfc group registry keeps a draining socket pinned") {
+  using coro_io::detail::jfc_group_registry;
+
+  jfc_group_registry registry(/*max_wr=*/128);
+  bool destroyed = false;
+  auto socket = std::make_shared<reentrant_socket>();
+  socket->registry = &registry;
+  socket->destroyed = &destroyed;
+  socket->sid = registry.attach(socket, 64);
+  REQUIRE(socket->sid >= 0);
+  const int sid = socket->sid;
+  CHECK(registry.pin(sid, socket));
+  CHECK_FALSE(registry.pin(9999, socket));
+
+  // The application drops its handle while the jetty is still draining: the
+  // pin keeps the socket, its routing and its CQ reservation alive.
+  socket.reset();
+  CHECK_FALSE(destroyed);
+  CHECK(registry.has_live_socket());
+  CHECK(registry.used_wr() == 64);
+  CHECK(registry.attach(std::make_shared<mock_group_socket>(), 128) == -2);
+
+  // Drained: detach releases the reservation and then the pin. The pin is
+  // dropped after the registry lock is released, otherwise the destructor's
+  // re-entrant detach() would deadlock here.
+  CHECK(registry.detach(sid));
+  CHECK(destroyed);
+  CHECK(registry.used_wr() == 0);
+  CHECK_FALSE(registry.has_live_socket());
+}
+
 TEST_CASE("urma jfc group registry resolves a completion batch at once") {
   using coro_io::detail::jfc_group_registry;
   using coro_io::detail::jfc_group_socket;
@@ -657,6 +753,55 @@ TEST_CASE("urma shared jfc group needs an executor and a device context") {
   using coro_io::detail::urma_jfc_group;
   // Degenerate inputs must fail instead of dereferencing a null executor.
   CHECK(urma_jfc_group::get(nullptr, nullptr, 1024, 0, 50) == nullptr);
+}
+
+TEST_CASE("urma async event hub routes object errors to live subscribers") {
+  coro_io::urma_async_event_hub hub(/*context=*/nullptr);
+  int jetty_a = 0, jetty_b = 0;  // stand-ins for urma objects (addresses)
+  auto owner_a = std::make_shared<int>(0);
+  auto owner_b = std::make_shared<int>(0);
+  std::vector<urma_async_event_type_t> seen_a, seen_b;
+  hub.subscribe(&jetty_a, owner_a, [&](urma_async_event_type_t type) {
+    seen_a.push_back(type);
+  });
+  hub.subscribe(&jetty_b, owner_b, [&](urma_async_event_type_t type) {
+    seen_b.push_back(type);
+  });
+  // Without a context there is no async fd, hence no watcher thread.
+  CHECK_FALSE(hub.running());
+  CHECK(hub.subscriber_count() == 2);
+
+  // An object error reaches only the subscriber of that object.
+  CHECK(hub.dispatch(URMA_EVENT_JETTY_ERR, &jetty_a) == 1);
+  CHECK(hub.dispatch(URMA_EVENT_JFC_ERR, &jetty_b) == 1);
+  CHECK(seen_a == std::vector{URMA_EVENT_JETTY_ERR});
+  CHECK(seen_b == std::vector{URMA_EVENT_JFC_ERR});
+
+  // Watermark and port notifications do not close anything.
+  CHECK(hub.dispatch(URMA_EVENT_JETTY_LIMIT, &jetty_a) == 0);
+  CHECK(hub.dispatch(URMA_EVENT_PORT_DOWN, nullptr) == 0);
+  int unknown = 0;
+  CHECK(hub.dispatch(URMA_EVENT_JETTY_ERR, &unknown) == 0);
+
+  // A device-fatal event fails every live subscriber.
+  CHECK(hub.dispatch(URMA_EVENT_DEV_FATAL, nullptr) == 2);
+
+  // An expired owner is skipped (a recycled address must not reach it), and
+  // an unsubscribed object is gone.
+  owner_b.reset();
+  CHECK(hub.dispatch(URMA_EVENT_JETTY_ERR, &jetty_b) == 0);
+  hub.unsubscribe(&jetty_a);
+  CHECK(hub.dispatch(URMA_EVENT_JETTY_ERR, &jetty_a) == 0);
+  CHECK(seen_a.size() == 2);
+  CHECK(seen_b.size() == 2);
+
+  // A new subscription prunes expired entries.
+  int jetty_c = 0;
+  auto owner_c = std::make_shared<int>(0);
+  hub.subscribe(&jetty_c, owner_c, [](urma_async_event_type_t) {
+  });
+  CHECK(hub.subscriber_count() == 1);
+  hub.shutdown();
 }
 
 TEST_CASE("urma rpc env disabled keeps default client tcp config") {

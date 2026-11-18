@@ -161,6 +161,7 @@ struct urma_socket_shared_state_t
         buffer_pool_(device_->get_buffer_pool()),
         socket_(executor->get_asio_executor()),
         poll_timer_(executor->get_asio_executor()),
+        drain_timer_(executor->get_asio_executor()),
         recv_buffer_cnt_(recv_buffer_cnt),
         recv_queue_(recv_buffer_cnt + 1),
         recv_result_(cq_size),
@@ -253,7 +254,8 @@ struct urma_socket_shared_state_t
     }
     if (shared_jfc_) {
       group_ = urma_jfc_group::get(executor_, device_->context(),
-                                   group_cq_size_, cap.max_jfc_depth, io_rate_);
+                                   group_cq_size_, cap.max_jfc_depth, io_rate_,
+                                   device_->async_events());
       int sid = -1;
       if (group_ && group_->valid()) {
         sid = group_->attach(
@@ -369,7 +371,53 @@ struct urma_socket_shared_state_t
     }
     ELOG_INFO << "urma_create_jetty succeeded: jetty_id=" << jetty_->jetty_id.id
               << ", uasid=" << jetty_->jetty_id.uasid;
+    // Cached: the jetty is deleted as soon as it drains after close(), while
+    // the socket object (and its accessors) may live on.
+    local_jetty_id_ = jetty_->jetty_id.id;
+    local_jetty_uasid_ = jetty_->jetty_id.uasid;
+    if (group_ && !group_->bind_jetty(group_sid_.load(), local_jetty_id_)) {
+      ELOG_WARN << "URMA shared JFC: cannot bind jetty " << local_jetty_id_
+                << " to sid " << group_sid_.load()
+                << "; its FLUSH_ERR_DONE cannot be routed and close() will "
+                   "wait for the drain deadline";
+    }
+    subscribe_async_events();
     return true;
+  }
+
+  // Jetty / JFR / own-JFC error events close the socket. The shared JFC is
+  // subscribed by its group.
+  void subscribe_async_events() {
+    auto hub = device_->async_events();
+    if (!hub)
+      return;
+    std::weak_ptr<urma_socket_shared_state_t> weak = weak_from_this();
+    auto executor = executor_->get_asio_executor();
+    auto handler = [weak, executor](urma_async_event_type_t type) {
+      // Watcher thread: hop to the socket's io_context.
+      asio::post(executor, [weak, type] {
+        if (auto self = weak.lock())
+          self->on_async_event(type);
+      });
+    };
+    hub->subscribe(jetty_.get(), weak, handler);
+    hub->subscribe(jfr_.get(), weak, handler);
+    if (jfc_)
+      hub->subscribe(jfc_.get(), weak, handler);
+  }
+
+  void unsubscribe_async_event(const void* object) {
+    if (object)
+      if (auto hub = device_->async_events())
+        hub->unsubscribe(object);
+  }
+
+  void on_async_event(urma_async_event_type_t type) {
+    if (has_close_)
+      return;  // already closing; the drain deadline bounds the wait
+    ELOG_ERROR << "URMA async error event " << static_cast<int>(type)
+               << " on jetty " << local_jetty_id_ << "; closing the socket";
+    fail_on_error_completion(std::make_error_code(std::errc::io_error));
   }
 
   void set_init_error(std::string_view stage, int error) {
@@ -399,6 +447,10 @@ struct urma_socket_shared_state_t
   }
 
   std::error_code fill_recv_queue() {
+    // A handshake can resume after close(): the jfr may already be in drain or
+    // deleted, and a buffer posted now would never be returned.
+    if (has_close_ || !jfr_)
+      return std::make_error_code(std::errc::not_connected);
     while (recv_queue_.size() < recv_buffer_cnt_) {
       auto buffer = buffer_pool_->get_buffer();
       if (!buffer)
@@ -529,7 +581,10 @@ struct urma_socket_shared_state_t
         // A hardware-constructed record does not complete any posted WR:
         // matching it would pop an unrelated pending send / recv buffer.
         if (is_hw_constructed_cr(completions[i])) {
-          log_hw_constructed_cr(completions[i]);
+          if (is_own_jetty_record(completions[i]))
+            on_hw_constructed_completion(completions[i]);
+          else
+            log_hw_constructed_cr(completions[i]);
           continue;
         }
         if (completions[i].flag.bs.s_r == 0)
@@ -555,6 +610,33 @@ struct urma_socket_shared_state_t
               << static_cast<int>(cr.status)
               << ", direction=" << (cr.flag.bs.s_r ? "recv" : "send")
               << ", local_id=" << cr.local_id;
+  }
+
+  // A hardware-constructed record carries this jetty's id in local_id when
+  // flag.jetty is set (otherwise local_id is a JFS / JFR id).
+  bool is_own_jetty_record(const urma_cr_t& cr) const noexcept {
+    return cr.flag.bs.jetty != 0 && jetty_ && cr.local_id == local_jetty_id_;
+  }
+
+  void on_hw_constructed_completion(const urma_cr_t& cr) override {
+    if (cr.status != URMA_CR_WR_FLUSH_ERR_DONE) {
+      // SUSPEND_DONE: this socket never suspends its jetty on purpose; a TP
+      // error that suspends it surfaces as error completions / JETTY_ERR.
+      log_hw_constructed_cr(cr);
+      return;
+    }
+    if (draining_) {
+      finish_drain(/*confirmed=*/true);
+      return;
+    }
+    if (drained_)
+      return;
+    // The hardware moved the jetty to ERROR on its own and has already flushed
+    // every outstanding WR: close, and skip the drain wait.
+    ELOG_WARN << "URMA jetty " << local_jetty_id_
+              << " was flushed by the hardware; closing the socket";
+    hw_flushed_ = true;
+    fail_on_error_completion(std::make_error_code(std::errc::io_error));
   }
 
   // An error completion means the jetty (or its transport) has failed: every
@@ -989,26 +1071,34 @@ struct urma_socket_shared_state_t
     promise.setValue(ec);
   }
 
+  // Settles every pending callback. The send buffers of those WRs were posted
+  // and have not completed, so the hardware may still read them: they are
+  // quarantined until the jetty drains instead of going back to the shared
+  // pool, where another socket could reuse them under an in-flight DMA.
   void fail_pending(std::error_code ec) {
     if (recv_callback_)
       resume({ec, 0}, std::move(recv_callback_));
     while (!send_callbacks_.empty()) {
       auto pending = send_callbacks_.pop();
-      if (pending.buffer)
-        buffer_pool_->return_buffer(pending.buffer);
+      quarantine(pending.buffer);
       resume({ec, 0}, std::move(pending.callback));
     }
     if (send_slots_) {
-      // Shared JFC: settle every in-flight send slot (buffer + callback) so a
-      // closing socket does not leak them. drain_each visits every live slot,
-      // so sequence holes cannot strand an entry.
+      // Shared JFC: drain_each visits every live slot, so sequence holes
+      // cannot strand an entry.
       send_slots_->drain_each([this, ec](pending_send&& pending) {
-        if (pending.buffer)
-          buffer_pool_->return_buffer(pending.buffer);
+        quarantine(pending.buffer);
         resume({ec, 0}, std::move(pending.callback));
       });
     }
     wake_writer(ec);
+  }
+
+  void quarantine(urma_buffer_t& buffer) {
+    if (!buffer)
+      return;
+    quarantined_.push_back(buffer);
+    buffer = {};
   }
 
   // In-flight send window: the shared path accounts by the seq slot ring, the
@@ -1019,29 +1109,155 @@ struct urma_socket_shared_state_t
     return send_callbacks_.size();
   }
 
+  // Every path that ends a connection goes through close(): user close, peer
+  // close, error completions, group failure, async events and the destructor.
+  // It settles all callbacks at once and starts the jetty drain; the hardware
+  // resources and buffers are released by finish_drain().
   void close() {
-    const bool first = !has_close_.exchange(true);
-    if (first) {
-      std::error_code ignored;
-      poll_timer_.cancel();
-      if (event_fd_)
-        event_fd_->cancel(ignored);
-      socket_.cancel(ignored);
-      socket_.close(ignored);
+    if (has_close_.exchange(true))
+      return;
+    std::error_code ignored;
+    poll_timer_.cancel();
+    if (event_fd_)
+      event_fd_->cancel(ignored);
+    socket_.cancel(ignored);
+    socket_.close(ignored);
+    fail_pending(std::make_error_code(std::errc::operation_canceled));
+    begin_drain();
+  }
+
+  // Close protocol, per the UMDK flush rules: move the jetty to ERROR and wait
+  // for FLUSH_ERR_DONE, which the hardware reports only once every outstanding
+  // tx/rx WR of the jetty has completed. Until then it may still DMA from the
+  // quarantined send buffers and into the posted recv buffers, and its flush
+  // records still land in the JFC, so the jetty, the buffers and the shared-JFC
+  // reservation are all kept. kDrainTimeout bounds the wait when the record
+  // never comes (no route, failed modify, failed group).
+  void begin_drain() {
+    if (draining_ || drained_)
+      return;
+    // Null when close() runs from the destructor: nothing can wait any more.
+    auto self = weak_from_this().lock();
+    if (!self || !jetty_ || hw_flushed_) {
+      finish_drain(/*confirmed=*/!jetty_ || hw_flushed_);
+      return;
     }
-    // Detach exactly once on every path that reaches close(), including the
-    // peer-close path (which used to set has_close_ directly and therefore
-    // never detached, leaving the group's CQ reservation stuck and its pending
-    // sends unsettled).
+    urma_jetty_attr_t attr{};
+    attr.mask = JETTY_STATE;
+    attr.state = URMA_JETTY_STATE_ERROR;
+    errno = 0;
+    if (urma_modify_jetty(jetty_.get(), &attr) != URMA_SUCCESS) {
+      ELOG_WARN << "urma_modify_jetty(ERROR) failed for jetty "
+                << local_jetty_id_ << ": errno=" << errno
+                << "; waiting for the drain deadline before releasing it";
+    }
+    draining_ = true;
+    if (group_)
+      group_->pin(group_sid_.load(), self);  // the registry is weak otherwise
+    else
+      drain_poll(self, 0);
+    if (draining_)
+      arm_drain_deadline(std::move(self));
+  }
+
+  void arm_drain_deadline(std::shared_ptr<urma_socket_shared_state_t> self) {
+    drain_timer_.expires_after(kDrainTimeout);
+    drain_timer_.async_wait([self](const std::error_code& ec) {
+      if (!ec)
+        self->finish_drain(/*confirmed=*/false);
+    });
+  }
+
+  // Per-socket JFC: nothing else polls it after close(), so look for the
+  // FLUSH_ERR_DONE here. Other records are flushes of WRs whose callbacks
+  // close() already settled. Spins for a few rounds (the record normally
+  // arrives within microseconds), then backs off to a timer so a drain that
+  // never completes costs no CPU until the deadline.
+  void drain_poll(std::shared_ptr<urma_socket_shared_state_t> self,
+                  std::size_t empty_rounds) {
+    if (!draining_)
+      return;
+    ack_pending_jfc_events();
+    std::array<urma_cr_t, 16> crs{};
+    const int count =
+        urma_poll_jfc(jfc_.get(), static_cast<int>(crs.size()), crs.data());
+    if (count < 0) {
+      finish_drain(/*confirmed=*/false);  // the JFC itself failed
+      return;
+    }
+    for (int i = 0; i < count && draining_; ++i) {
+      if (crs[i].status == URMA_CR_WR_FLUSH_ERR_DONE &&
+          is_own_jetty_record(crs[i]))
+        finish_drain(/*confirmed=*/true);
+    }
+    if (!draining_)
+      return;
+    empty_rounds = count > 0 ? 0 : empty_rounds + 1;
+    if (empty_rounds < kDrainSpinRounds) {
+      asio::post(executor_->get_asio_executor(), [self, empty_rounds] {
+        self->drain_poll(self, empty_rounds);
+      });
+      return;
+    }
+    poll_timer_.expires_after(kDrainPollInterval);
+    poll_timer_.async_wait([self](const std::error_code& ec) {
+      if (!ec)
+        self->drain_poll(self, kDrainSpinRounds);
+    });
+  }
+
+  // An event-mode JFC counts its completion events and urma_delete_jfc waits
+  // until each one is acked. The event loop may have re-armed the JFC right
+  // before close(), and the drain's flush records then raise an event nobody
+  // waits for: collect and ack it (time_out 0 never blocks). An armed JFC
+  // raises at most one event, and nothing re-arms it after close().
+  void ack_pending_jfc_events() {
+    if (!jfce_ || !jfc_)
+      return;
+    urma_jfc_t* ev_jfc = nullptr;
+    if (urma_wait_jfc(jfce_.get(), 1, 0, &ev_jfc) > 0 && ev_jfc) {
+      uint32_t ack_cnt = 1;
+      urma_ack_jfc(&ev_jfc, &ack_cnt, 1);
+    }
+  }
+
+  // Releases the jetty and everything the hardware may have been using, in the
+  // only safe order: delete the jetty, then its shared jfr, then return the
+  // buffers, then give the shared-JFC reservation back.
+  void finish_drain(bool confirmed) {
+    if (drained_)
+      return;
+    drained_ = true;
+    draining_ = false;
+    // detach() below may drop the group's pin, the last strong reference:
+    // stay alive until return. Null on the destructor path, which is fine.
+    auto self = weak_from_this().lock();
+    drain_timer_.cancel();
+    poll_timer_.cancel();
+    if (!confirmed) {
+      ELOG_WARN << "URMA jetty " << local_jetty_id_ << " saw no FLUSH_ERR_DONE"
+                << " within " << kDrainTimeout.count()
+                << "ms of close(); deleting it before releasing its buffers";
+    }
+    unsubscribe_async_event(jetty_.get());
+    unsubscribe_async_event(jfr_.get());
+    jetty_.reset();
+    jfr_.reset();
+    for (auto& buffer : quarantined_) buffer_pool_->return_buffer(buffer);
+    quarantined_.clear();
+    while (!recv_queue_.empty()) {
+      auto buffer = recv_queue_.pop();
+      buffer_pool_->return_buffer(buffer);
+    }
     const int sid = group_sid_.exchange(-1);
     if (group_ && sid >= 0)
       group_->detach(sid);
-    if (first)
-      fail_pending(std::make_error_code(std::errc::operation_canceled));
   }
 
   void release_resources() {
     close();
+    // close() could not wait here (no owner left): release synchronously.
+    finish_drain(/*confirmed=*/!jetty_);
     if (recv_buffer_)
       buffer_pool_->return_buffer(recv_buffer_);
     while (!recv_result_.empty()) {
@@ -1049,17 +1265,13 @@ struct urma_socket_shared_state_t
       if (pending.buffer)
         buffer_pool_->return_buffer(pending.buffer);
     }
-    while (!recv_queue_.empty()) {
-      auto buffer = recv_queue_.pop();
-      buffer_pool_->return_buffer(buffer);
-    }
     // Release stream_descriptor ownership before deleting the jfce fd.
     if (event_fd_)
       event_fd_->release();
     remote_seg_.reset();
     remote_jetty_.reset();
-    jetty_.reset();
-    jfr_.reset();
+    ack_pending_jfc_events();  // urma_delete_jfc waits for unacked events
+    unsubscribe_async_event(jfc_.get());
     jfc_.reset();
     jfce_.reset();
     // Last: the group's JFC must outlive the jetties that feed it.
@@ -1077,11 +1289,27 @@ struct urma_socket_shared_state_t
   uint32_t recv_seq_ = 0;
   std::unique_ptr<seq_slot_ring<pending_send>> send_slots_;
 
+  // Close/drain state (see begin_drain()). All of it is touched on the
+  // executor thread only, or from the destructor once nothing else can run.
+  static constexpr std::chrono::milliseconds kDrainTimeout{1000};
+  static constexpr std::chrono::milliseconds kDrainPollInterval{1};
+  static constexpr std::size_t kDrainSpinRounds = 32;
+  bool draining_ = false;
+  bool drained_ = false;
+  // The hardware already reported FLUSH_ERR_DONE before close(): no wait.
+  bool hw_flushed_ = false;
+  // Send buffers of WRs settled by close() but possibly still read by the
+  // hardware; returned to the pool by finish_drain().
+  std::vector<urma_buffer_t> quarantined_;
+  uint32_t local_jetty_id_ = 0;
+  uint32_t local_jetty_uasid_ = 0;
+
   ExecutorWrapper<>* executor_;
   std::shared_ptr<urma_device_wrapper_t> device_;
   std::shared_ptr<urma_buffer_pool_t> buffer_pool_;
   asio::ip::tcp::socket socket_;
   asio::steady_timer poll_timer_;
+  asio::steady_timer drain_timer_;
   std::unique_ptr<urma_jfc_t, urma_deleter> jfc_;
   std::unique_ptr<urma_jfr_t, urma_deleter> jfr_;
   std::unique_ptr<urma_jetty_t, urma_deleter> jetty_;
@@ -1426,7 +1654,7 @@ class urma_socket_t {
   }
   uint32_t get_local_qp_num() const noexcept {
     return handshake_local_port_ != 0 ? handshake_local_port_
-                                      : state_->jetty_->jetty_id.id;
+                                      : state_->local_jetty_id_;
   }
 
   constexpr static uint32_t urma_md5_header =
@@ -1518,8 +1746,8 @@ class urma_socket_t {
   urma_socket_info make_local_info() const {
     urma_socket_info info{};
     std::memcpy(info.eid, state_->device_->eid().raw, sizeof(info.eid));
-    info.uasid = state_->jetty_->jetty_id.uasid;
-    info.jetty_id = state_->jetty_->jetty_id.id;
+    info.uasid = state_->local_jetty_uasid_;
+    info.jetty_id = state_->local_jetty_id_;
     info.buffer_size = buffer_pool()->buffer_size();
     info.recv_buffer_cnt = conf_.recv_buffer_cnt;
     info.tp_type = static_cast<uint8_t>(conf_.tp_type);
@@ -1533,6 +1761,10 @@ class urma_socket_t {
   }
 
   std::error_code import_peer(const urma_socket_info& peer) {
+    // The handshake may resume after close(), when the local jetty is already
+    // draining or deleted (the bonding import below needs it).
+    if (state_->has_close_ || !state_->jetty_)
+      return std::make_error_code(std::errc::not_connected);
     urma_rjetty_t remote{};
     std::memcpy(remote.jetty_id.eid.raw, peer.eid, sizeof(peer.eid));
     remote.jetty_id.uasid = peer.uasid;
@@ -1676,7 +1908,7 @@ class urma_socket_t {
               << ", local=" << handshake_local_address_.to_string() << ":"
               << handshake_local_port_
               << ", remote_jetty_id=" << remote_jetty_id_
-              << ", local_jetty_id=" << state_->jetty_->jetty_id.id;
+              << ", local_jetty_id=" << state_->local_jetty_id_;
   }
 
   void release_recv_buffer() {

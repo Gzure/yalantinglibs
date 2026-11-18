@@ -39,6 +39,7 @@
 #include "asio/any_io_executor.hpp"
 #include "asio/post.hpp"
 #include "ylt/coro_io/coro_io.hpp"
+#include "ylt/coro_io/urma/urma_async_event.hpp"
 #include "ylt/easylog.hpp"
 
 namespace coro_io::detail {
@@ -176,6 +177,11 @@ class jfc_group_socket {
   virtual ~jfc_group_socket() = default;
   virtual void on_send_completion(const urma_cr_t& cr) = 0;
   virtual void on_recv_completion(const urma_cr_t& cr) = 0;
+  // A hardware-constructed record (SUSPEND_DONE / FLUSH_ERR_DONE) routed to
+  // this socket by its jetty id (cr.local_id), never by the invalid user_ctx.
+  // FLUSH_ERR_DONE is the hardware's statement that every outstanding tx/rx WR
+  // of the jetty has completed, i.e. that its buffers may be released.
+  virtual void on_hw_constructed_completion(const urma_cr_t&) {}
   // Group-level failure (poll error or a jfc error event): every attached
   // socket must fail its pending work and close.
   virtual void on_group_error(std::error_code ec) = 0;
@@ -212,22 +218,24 @@ class jfc_group_registry {
     if (next_sid_ >= kMaxSockets)
       return -1;
     const uint32_t sid = next_sid_++;
-    slots_[sid] = slot{std::move(socket), wr_reserve};
+    slot entry;
+    entry.weak = std::move(socket);
+    entry.reserve = wr_reserve;
+    slots_[sid] = std::move(entry);
     used_wr_ += wr_reserve;
     return static_cast<int>(sid);
   }
 
-  // Detaches a socket and releases its CQ reservation immediately.
-  //
-  // Caveat (needs device confirmation): CQEs the socket left in the shared JFC,
-  // and any flush completions the driver posts while deleting its jetty/jfr,
-  // still occupy physical CQ slots for a short while. If UMDK does not drain
-  // them before a new socket reserves the freed budget, the group can over-sell
-  // the CQ and new posts may fail with a full-CQ error. Those failures are
-  // handled (the send is failed back to the caller, unknown-sid completions are
-  // dropped), so the degradation is a transient error rather than corruption,
-  // but a device-side drain (or delaying the release) may be required.
+  // Detaches a socket: drops its routing entries and releases its CQ
+  // reservation. A closing socket must only detach once its jetty has drained
+  // (FLUSH_ERR_DONE seen, jetty/jfr deleted): until then its outstanding WRs
+  // and the flush records still land in the shared JFC, and releasing the
+  // budget early would let a new socket over-sell the CQ (a JFC overflow is a
+  // fatal async error for every socket of the group).
   bool detach(int sid) {
+    // Declared before the lock so a pinned socket is released after unlock:
+    // dropping the last reference runs its destructor, which may re-enter.
+    std::shared_ptr<jfc_group_socket> released_pin;
     std::lock_guard<std::mutex> lock(mutex_);
     if (sid < 0)
       return false;
@@ -236,7 +244,38 @@ class jfc_group_registry {
       return false;
     if (used_wr_ >= it->second.reserve)
       used_wr_ -= it->second.reserve;
+    if (it->second.has_jetty) {
+      auto jt = jetty_index_.find(it->second.jetty_id);
+      if (jt != jetty_index_.end() && jt->second == it->first)
+        jetty_index_.erase(jt);
+    }
+    released_pin = std::move(it->second.pin);
     slots_.erase(it);
+    return true;
+  }
+
+  // Associates the socket's jetty id with its sid, so records that carry no
+  // valid user_ctx can still be routed (by cr.local_id).
+  bool bind_jetty(int sid, uint32_t jetty_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = slot_locked(sid);
+    if (it == slots_.end())
+      return false;
+    it->second.jetty_id = jetty_id;
+    it->second.has_jetty = true;
+    jetty_index_[jetty_id] = it->first;
+    return true;
+  }
+
+  // Keeps a draining socket alive until it detaches: the registry otherwise
+  // holds only a weak reference, and the application may drop its last handle
+  // right after close() while the hardware still owns the socket's buffers.
+  bool pin(int sid, std::shared_ptr<jfc_group_socket> socket) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = slot_locked(sid);
+    if (it == slots_.end() || !socket)
+      return false;
+    it->second.pin = std::move(socket);
     return true;
   }
 
@@ -257,7 +296,7 @@ class jfc_group_registry {
     for (std::size_t i = 0; i < count; ++i) {
       out[i].reset();
       uint32_t sid = 0;
-      if (!routable(crs[i], sid))
+      if (!routable_locked(crs[i], sid))
         continue;
       auto it = slots_.find(sid);
       if (it == slots_.end())
@@ -271,7 +310,9 @@ class jfc_group_registry {
 
   // Delivers a record that resolve() routed to `socket`.
   static void deliver(jfc_group_socket& socket, const urma_cr_t& cr) {
-    if (cr.flag.bs.s_r == 0)
+    if (is_hw_constructed_cr(cr))
+      socket.on_hw_constructed_completion(cr);
+    else if (cr.flag.bs.s_r == 0)
       socket.on_send_completion(cr);
     else
       socket.on_recv_completion(cr);
@@ -323,8 +364,11 @@ class jfc_group_registry {
   }
 
   void clear() {
+    // Destroyed after the lock is released: see detach().
+    std::unordered_map<uint32_t, slot> released;
     std::lock_guard<std::mutex> lock(mutex_);
-    slots_.clear();
+    released.swap(slots_);
+    jetty_index_.clear();
     used_wr_ = 0;
   }
 
@@ -340,12 +384,33 @@ class jfc_group_registry {
   struct slot {
     std::weak_ptr<jfc_group_socket> weak;
     uint32_t reserve = 0;
+    uint32_t jetty_id = 0;
+    bool has_jetty = false;
+    // Strong reference held only while the socket drains (see pin()).
+    std::shared_ptr<jfc_group_socket> pin;
   };
 
-  // Validates a record and extracts its sid. Rejects hardware-constructed
-  // records first: their user_ctx is invalid and must not be decoded.
-  static bool routable(const urma_cr_t& cr, uint32_t& sid) noexcept {
-    if (is_hw_constructed_cr(cr) || cr.user_ctx == 0)
+  std::unordered_map<uint32_t, slot>::iterator slot_locked(int sid) {
+    if (sid < 0)
+      return slots_.end();
+    return slots_.find(static_cast<uint32_t>(sid));
+  }
+
+  // Validates a record and extracts its sid. A hardware-constructed record has
+  // an invalid user_ctx, so it is routed by the jetty id in cr.local_id, and
+  // only when the record says local_id is a jetty id (flag.jetty == 1): JFS /
+  // JFR ids live in other id spaces and could alias a jetty id.
+  bool routable_locked(const urma_cr_t& cr, uint32_t& sid) const noexcept {
+    if (is_hw_constructed_cr(cr)) {
+      if (cr.flag.bs.jetty == 0)
+        return false;
+      auto it = jetty_index_.find(cr.local_id);
+      if (it == jetty_index_.end())
+        return false;
+      sid = it->second;
+      return true;
+    }
+    if (cr.user_ctx == 0)
       return false;
     const auto ctx = decode_ctx(cr.user_ctx);
     if (!is_valid_ctx_op(ctx.op))
@@ -363,9 +428,15 @@ class jfc_group_registry {
   // cannot block every future attach.
   void prune_expired_locked() {
     for (auto it = slots_.begin(); it != slots_.end();) {
+      // A pinned socket cannot expire: the pin holds a strong reference.
       if (it->second.weak.expired()) {
         if (used_wr_ >= it->second.reserve)
           used_wr_ -= it->second.reserve;
+        if (it->second.has_jetty) {
+          auto jt = jetty_index_.find(it->second.jetty_id);
+          if (jt != jetty_index_.end() && jt->second == it->first)
+            jetty_index_.erase(jt);
+        }
         it = slots_.erase(it);
       }
       else {
@@ -376,6 +447,7 @@ class jfc_group_registry {
 
   mutable std::mutex mutex_;
   std::unordered_map<uint32_t, slot> slots_;
+  std::unordered_map<uint32_t, uint32_t> jetty_index_;  // jetty id -> sid
   uint32_t next_sid_ = 0;
   std::size_t used_wr_ = 0;
   std::size_t max_wr_ = 0;
@@ -411,9 +483,14 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   // also makes the execution_context address used as the lookup key stable for
   // as long as the group lives, so a recycled address cannot route a socket to
   // a stale group.
+  //
+  // async_events (optional) is the device's async event hub: the group
+  // subscribes its JFC, so a JFC error event (e.g. an overflow) fails every
+  // attached socket instead of leaving them on a JFC that never completes.
   static std::shared_ptr<urma_jfc_group> get(
       coro_io::ExecutorWrapper<>* executor, urma_context_t* context,
-      uint32_t cq_size, uint32_t max_cq_depth, uint32_t io_rate) {
+      uint32_t cq_size, uint32_t max_cq_depth, uint32_t io_rate,
+      std::shared_ptr<urma_async_event_hub> async_events = nullptr) {
     if (!executor || !context)
       return nullptr;
     auto asio_executor = executor->get_asio_executor();
@@ -454,11 +531,17 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
         }
       }
       groups[key] = group;
-      return group;
     }
+    group->subscribe_async_events(std::move(async_events));
+    return group;
   }
 
-  ~urma_jfc_group() { stop(); }
+  ~urma_jfc_group() {
+    stop();
+    // Before jfc_ is deleted, so a recycled address cannot reach this group.
+    if (async_events_)
+      async_events_->unsubscribe(jfc_.get());
+  }
 
   bool valid() const noexcept { return static_cast<bool>(jfc_); }
 
@@ -495,6 +578,13 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   }
 
   void detach(int sid) { registry_.detach(sid); }
+  bool bind_jetty(int sid, uint32_t jetty_id) {
+    return registry_.bind_jetty(sid, jetty_id);
+  }
+  // Keeps a draining socket alive until detach(); see jfc_group_registry::pin.
+  bool pin(int sid, std::shared_ptr<jfc_group_socket> socket) {
+    return registry_.pin(sid, std::move(socket));
+  }
 
   // Starts the single poll tick for this io_context (idempotent).
   void ensure_polling() {
@@ -644,6 +734,26 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
     }
   }
 
+  void subscribe_async_events(std::shared_ptr<urma_async_event_hub> hub) {
+    if (!hub)
+      return;
+    async_events_ = std::move(hub);
+    std::weak_ptr<urma_jfc_group> weak = weak_from_this();
+    auto executor = executor_;
+    async_events_->subscribe(
+        jfc_.get(), weak, [weak, executor](urma_async_event_type_t type) {
+          // Watcher thread: hop to the group's io_context.
+          asio::post(executor, [weak, type] {
+            auto group = weak.lock();
+            if (!group || group->failed())
+              return;
+            ELOG_ERROR << "URMA shared JFC async error event "
+                       << static_cast<int>(type);
+            group->fail_all(std::make_error_code(std::errc::io_error));
+          });
+        });
+  }
+
   void fail_all(std::error_code ec) {
     // Publish the failure while holding the same mutex attach() uses, and set
     // failed_ first: a concurrent attach then either sees it (and returns -3)
@@ -686,6 +796,7 @@ class urma_jfc_group : public std::enable_shared_from_this<urma_jfc_group> {
   static constexpr std::size_t kPollBatch = 16;
 
   asio::any_io_executor executor_;
+  std::shared_ptr<urma_async_event_hub> async_events_;
   std::unique_ptr<urma_jfc_t, jfc_deleter> jfc_;
   // Orders attach() against fail_all() and the poll loop's idle exit.
   std::mutex state_mutex_;

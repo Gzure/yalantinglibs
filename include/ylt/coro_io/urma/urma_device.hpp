@@ -29,6 +29,8 @@
 #ifdef YLT_ENABLE_URMA
 #include <urma_api.h>
 #include <urma_ubagg.h>
+
+#include "ylt/coro_io/urma/urma_async_event.hpp"
 #endif
 
 namespace coro_io {
@@ -73,6 +75,12 @@ class urma_device_wrapper_t {
     std::lock_guard lock(buffer_pool_mutex_);
     return buffer_pool_;
   }
+#ifdef YLT_ENABLE_URMA
+  // Async (exception) events of this device context; null before init().
+  std::shared_ptr<urma_async_event_hub> async_events() const {
+    return async_events_;
+  }
+#endif
 
   void set_bonding_config(uint32_t mode, uint32_t level) {
     bond_mode_ = mode;
@@ -88,6 +96,9 @@ class urma_device_wrapper_t {
   urma_device_attr_t device_attr_{};
   std::shared_ptr<urma_buffer_pool_t> buffer_pool_;
   mutable std::mutex buffer_pool_mutex_;
+#ifdef YLT_ENABLE_URMA
+  std::shared_ptr<urma_async_event_hub> async_events_;
+#endif
   uint32_t bond_mode_ = BONDP_BONDING_MODE_STANDALONE;
   uint32_t bond_level_ = BONDP_BONDING_LEVEL_IODIE;
 };
@@ -287,6 +298,8 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name,
   }
 
   urma_free_device_list(devices);
+  // The watcher thread starts with the first subscription.
+  async_events_ = std::make_shared<urma_async_event_hub>(context_);
   auto default_pool_config = urma_buffer_pool_config_t{};
   if (!configure_buffer_pool(default_pool_config.buffer_size,
                              default_pool_config.max_memory_usage)) {
@@ -304,6 +317,9 @@ inline bool urma_device_wrapper_t::init(const std::string& device_name,
 inline void urma_device_wrapper_t::close() {
 #ifdef YLT_ENABLE_URMA
   if (context_) {
+    // The watcher reads the context's async fd: stop it first.
+    if (async_events_)
+      async_events_->shutdown();
     {
       std::lock_guard lock(buffer_pool_mutex_);
       buffer_pool_.reset();
